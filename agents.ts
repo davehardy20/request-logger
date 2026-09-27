@@ -25,8 +25,8 @@ export type RendererId = "anthropic" | "openai" | "gemini" | "raw";
 
 /**
  * What the student picked. This, and only this, is what gets saved to disk —
- * except customBaseUrl and customRenderer, which exist only for a custom
- * target and are the one documented exception. See config.ts.
+ * except the custom target fields, which are the one documented exception.
+ * See config.ts.
  */
 export interface AgentChoice {
   agent: string;
@@ -35,6 +35,12 @@ export interface AgentChoice {
   customBaseUrl?: string;
   /** Only set when provider is CUSTOM_ID: the wire format they chose for it. */
   customRenderer?: RendererId;
+  /**
+   * Selected model for a custom target that needs one declared up front:
+   * OpenCode's custom OpenAI-compatible route, and any of Pi's custom
+   * routes (see resolveCustomTarget).
+   */
+  customModel?: string;
 }
 
 export interface ResolvedTarget {
@@ -71,7 +77,12 @@ export interface CustomTarget {
   agentLabel: string;
   /** Always "Custom base URL": there is no catalogue provider label to show. */
   providerLabel: string;
-  /** The scheme+host[+port] the student typed, with any path stripped. */
+  /**
+   * The scheme+host[+port] the student typed, plus any path prefix it
+   * carried (e.g. https://opencode.ai/zen/go). proxy.ts joins that prefix
+   * against each request's own path when forwarding — see
+   * upstreamPathPrefix in proxy.ts.
+   */
   upstreamBaseUrl: string;
   renderer: RendererId;
   baseUrl: string;
@@ -109,11 +120,7 @@ export interface SetupRequest {
 }
 
 export type Resolution =
-  | ResolvedTarget
-  | CustomTarget
-  | AgentRefusal
-  | ResolveError
-  | SetupRequest;
+  ResolvedTarget | CustomTarget | AgentRefusal | ResolveError | SetupRequest;
 
 /**
  * The last option in both questions.
@@ -230,8 +237,19 @@ const PI_NOTE =
  * Pi's provider override file. The key is `baseUrl`, in this exact spelling.
  * Pi accepts other spellings into the file and then refuses to start, so this
  * is worth getting right for the student.
+ *
+ * `modelId`, when given, is written as a one-entry `models` array under the
+ * same provider. Pi replaces that provider's whole built-in model catalogue
+ * with whatever `models` lists — see resolveCustomTarget's Pi branch, which
+ * is the only caller that passes it. Omitted, as it is for every catalogue
+ * entry above, Pi keeps its built-in catalogue for that provider, which is
+ * correct there because those routes really do talk to Anthropic or OpenAI.
  */
-function piModels(providerId: string, baseUrl: string): SetupFile {
+function piModels(
+  providerId: string,
+  baseUrl: string,
+  modelId?: string
+): SetupFile {
   return {
     path: "~/.pi/agent/models.json",
     language: "json",
@@ -239,7 +257,8 @@ function piModels(providerId: string, baseUrl: string): SetupFile {
       "{",
       '  "providers": {',
       `    "${providerId}": {`,
-      `      "baseUrl": "${baseUrl}"`,
+      `      "baseUrl": "${baseUrl}"${modelId ? "," : ""}`,
+      ...(modelId ? [`      "models": [{ "id": "${modelId}" }]`] : []),
       "    }",
       "  }",
       "}",
@@ -272,6 +291,92 @@ const OMP_NOTE =
   "any other server that speaks one of the wire formats offered here, so " +
   "every OMP setup goes through the base URL and wire format you chose.";
 
+/**
+ * Junie's custom-proxy override, in JSON, under ~/.junie/config.json (user
+ * scope; see Junie's own configuration-files docs for how a project-scope
+ * file layers on top). Unlike ompModels/piModels, this one genuinely differs
+ * by wire format: Junie's proxy entry declares a `kind` — the protocol Junie
+ * itself will speak on the wire — so a mismatched kind does not 404, it just
+ * sends the wrong shape of request. That is why Junie gets two catalogue
+ * providers below (tagged by customTemplateFor) instead of OMP's one: the
+ * kind, and the auth header format that goes with it, must track the
+ * renderer the student actually picked.
+ *
+ * `authHeader` is a placeholder line, not a real credential — see JUNIE_NOTE.
+ */
+function junieConfig(
+  baseUrl: string,
+  kind: "Anthropic" | "OpenAI",
+  authHeader: string
+): SetupFile {
+  return {
+    path: "~/.junie/config.json",
+    language: "json",
+    body: [
+      "{",
+      '  "proxies": [',
+      "    {",
+      '      "name": "request-logger",',
+      `      "kind": "${kind}",`,
+      `      "api-url": "${baseUrl}",`,
+      `      "headers": ["${authHeader}"]`,
+      "    }",
+      "  ],",
+      '  "provider": "request-logger"',
+      "}",
+    ].join("\n"),
+  };
+}
+
+const JUNIE_NOTE =
+  "Junie has no existing login for this tool to pass through the way Claude " +
+  "Code or Codex do. Its custom proxy bypasses JetBrains AI authentication " +
+  "entirely, so a real API key for whichever backend you are logging goes " +
+  "straight into config.json's headers array in plaintext. Do not commit " +
+  "this file.";
+
+const JUNIE_MERGE_NOTE =
+  "This is merged into ~/.junie/config.json, not a replacement for it — add " +
+  "the proxies entry and the provider key alongside whatever else is " +
+  "already in that file.";
+
+/**
+ * Antigravity CLI (`agy`) is a separate Google product from Gemini CLI — a
+ * different binary, a different agent harness — but its API-key route stores
+ * its settings under Gemini CLI's own directory (`~/.gemini/...`) and, per
+ * Google's docs, calls the public Gemini API directly and reads the exact
+ * same GOOGLE_GEMINI_BASE_URL variable Gemini CLI's own API-key route does.
+ * The existing "gemini" renderer already reads that wire format correctly,
+ * so this entry needed no renderer of its own — only a catalogue entry with
+ * the right bin and the settings file that switches this route on.
+ */
+const ANTIGRAVITY_NOTE =
+  "Antigravity CLI is a different product from Gemini CLI, with its own " +
+  "binary (agy, not gemini). This route works the same as Gemini CLI's API " +
+  "key route, though: both call the public Gemini API directly and read the " +
+  "same GOOGLE_GEMINI_BASE_URL variable, so the existing gemini renderer " +
+  "reads this capture correctly with no changes.";
+
+const ANTIGRAVITY_KEY_NOTE =
+  "GEMINI_API_KEY must also be exported in your shell, and modelProvider " +
+  'must be "gemini" in the settings file below. Without both, Antigravity ' +
+  "CLI falls back to its own account sign-in instead — a different, " +
+  "unverified route this catalogue does not cover yet (see the warning below).";
+
+const ANTIGRAVITY_MERGE_NOTE =
+  "This is merged into ~/.gemini/antigravity-cli/settings.json, not a " +
+  "replacement for it — add modelProvider alongside whatever else is " +
+  "already in that file.";
+
+const ANTIGRAVITY_LOGIN_WARNING =
+  "This entry covers the Gemini API key route only. Antigravity CLI's " +
+  "default account sign-in was not verified against real source (it is " +
+  "closed source) or a real login, and public reporting on the Antigravity " +
+  "IDE suggests its account-login traffic can go to a different, internal " +
+  "host rather than the Code Assist host Gemini CLI's own free login uses — " +
+  "so this catalogue does not claim that route works. Ask for it via the " +
+  "issue tracker if you need it logged.";
+
 const OPENCODE_NOTE =
   "The environment variable above works, but only by accident: OpenCode passes " +
   "no base URL of its own for this provider, so the bundled SDK falls back to " +
@@ -296,6 +401,15 @@ const AGENTS: AgentEntry[] = [
           ["ENABLE_TOOL_SEARCH", "true"],
         ],
         bin: "claude",
+        // Claude Code's own wire format is Anthropic-shaped regardless of
+        // what a custom target claims to speak, so this stays the catch-all
+        // for every wire format a custom target might pick — the same
+        // "used regardless of the wire format chosen" guarantee this agent
+        // had when it was the only provider, back when findCustomTemplate's
+        // single-provider branch picked it unconditionally. Now that
+        // "vertex" (below) is a second provider, that branch no longer
+        // fires, so the guarantee has to be spelled out here instead.
+        customTemplateFor: ["anthropic", "openai", "raw"],
         notes: [
           "ENABLE_TOOL_SEARCH=true is important. Claude Code trusts one host only. " +
             "When the base URL points somewhere else, it turns off tool search, stops " +
@@ -304,6 +418,44 @@ const AGENTS: AgentEntry[] = [
             "flag turns that effect off, so what you read is what Claude Code really sends.",
           "This works with a Claude subscription login. Your login stays active. " +
             "Only the model traffic moves.",
+        ],
+      },
+      {
+        id: "vertex",
+        label: "Google Vertex AI",
+        // Fixed to the global endpoint on purpose — see the region note below.
+        upstreamHost: "aiplatform.googleapis.com",
+        // Vertex's Claude endpoint is Anthropic's own Messages API shape,
+        // routed by URL path instead of a body field — the model ID moves
+        // from the body's "model" key into the URL
+        // (.../publishers/anthropic/models/{model}:streamRawPredict), and
+        // the body gains "anthropic_version". findModel() in render.ts
+        // already falls back to reading the model out of the path when the
+        // body has none, and the Anthropic renderer only reads specific
+        // known keys, so the existing "anthropic" renderer reads this
+        // correctly without a dedicated renderer of its own.
+        renderer: "anthropic",
+        env: [
+          ["ANTHROPIC_VERTEX_BASE_URL", "{baseUrl}"],
+          ["ENABLE_TOOL_SEARCH", "true"],
+        ],
+        bin: "claude",
+        notes: [
+          "This assumes CLAUDE_CODE_USE_VERTEX=1, CLOUD_ML_REGION and " +
+            "ANTHROPIC_VERTEX_PROJECT_ID are already exported in your shell — " +
+            "request-logger does not set those, only ANTHROPIC_VERTEX_BASE_URL, " +
+            "which is the variable Claude Code actually reads for a base-URL " +
+            "override once Vertex mode is on. ANTHROPIC_BASE_URL, used by the " +
+            "plain Anthropic route above, is silently ignored in Vertex mode — " +
+            "that mismatch is the usual reason a Vertex student's logs folder " +
+            "stays empty.",
+          "Only CLOUD_ML_REGION=global is supported by this entry. A regional " +
+            "value (us-east5, say) talks to a different host " +
+            "({region}-aiplatform.googleapis.com), which this entry does not " +
+            "resolve to yet — ask for it via the issue tracker if you hit this.",
+          "ENABLE_TOOL_SEARCH=true matters here for the same reason it does on " +
+            "the plain Anthropic route above: a non-default host turns off tool " +
+            "search unless this is set.",
         ],
       },
     ],
@@ -514,7 +666,7 @@ const AGENTS: AgentEntry[] = [
           {
             path: "~/.pi/agent/settings.json",
             language: "json",
-            body: ['{', '  "transport": "sse"', "}"].join("\n"),
+            body: ["{", '  "transport": "sse"', "}"].join("\n"),
           },
         ],
         notes: [
@@ -597,6 +749,87 @@ const AGENTS: AgentEntry[] = [
     ],
   },
   {
+    id: "antigravity",
+    label: "Antigravity CLI",
+    providers: [
+      {
+        id: "api-key",
+        label: "Gemini API key",
+        upstreamHost: "generativelanguage.googleapis.com",
+        renderer: "gemini",
+        env: [["GOOGLE_GEMINI_BASE_URL", "{baseUrl}"]],
+        bin: "agy",
+        setup: [
+          {
+            path: "~/.gemini/antigravity-cli/settings.json",
+            language: "json",
+            body: ["{", '  "modelProvider": "gemini"', "}"].join("\n"),
+          },
+        ],
+        notes: [ANTIGRAVITY_NOTE, ANTIGRAVITY_KEY_NOTE, ANTIGRAVITY_MERGE_NOTE],
+        warnings: [ANTIGRAVITY_LOGIN_WARNING],
+      },
+    ],
+  },
+  {
+    id: "junie",
+    label: "Junie",
+    // Junie is BYOK across several backends (OpenAI, Anthropic, Google, xAI,
+    // OpenRouter, Copilot, a LiteLLM proxy) with no single fixed host of its
+    // own — the same shape as OMP — so every setup for it is custom too. See
+    // AgentEntry.alwaysCustom.
+    //
+    // Junie CLI is closed source, so unlike every other entry in this
+    // catalogue this one is verified against JetBrains' published docs only,
+    // not against real source or a real install. Testing status is recorded
+    // in the README's "How much this was tested" section, the same way every
+    // other agent's is; it is not printed to the student, the same way no
+    // other agent's is either.
+    alwaysCustom: true,
+    providers: [
+      {
+        id: "anthropic",
+        label: "Anthropic-compatible",
+        // Unused: Junie never reaches the normal (non-custom) resolution
+        // path that would read this. See resolveCustomTarget.
+        upstreamHost: "",
+        renderer: "raw",
+        bin: "junie",
+        customTemplateFor: ["anthropic"],
+        setup: [
+          junieConfig(
+            "{baseUrl}",
+            "Anthropic",
+            "x-api-key: YOUR_ANTHROPIC_API_KEY"
+          ),
+        ],
+        notes: [JUNIE_NOTE, JUNIE_MERGE_NOTE],
+      },
+      {
+        id: "openai",
+        label: "OpenAI-compatible",
+        // Unused, same as the Anthropic-compatible entry above: Junie never
+        // reaches the normal (non-custom) resolution path that would read
+        // this. See resolveCustomTarget.
+        upstreamHost: "",
+        renderer: "raw",
+        bin: "junie",
+        // Also the catch-all for "raw"/not sure — see the OpenCode and Pi
+        // entries above for why an OpenAI-compatible guess is the better
+        // default for an unidentified custom server.
+        customTemplateFor: ["openai", "raw"],
+        setup: [
+          junieConfig(
+            "{baseUrl}",
+            "OpenAI",
+            "Authorization: Bearer YOUR_OPENAI_API_KEY"
+          ),
+        ],
+        notes: [JUNIE_NOTE, JUNIE_MERGE_NOTE],
+      },
+    ],
+  },
+  {
     id: "amp",
     label: "Amp",
     reason:
@@ -638,7 +871,14 @@ export function listAgents(): AgentSummary[] {
     id: agent.id,
     label: agent.label,
     supported: agent.providers != null,
-    needsProvider: (agent.providers?.length ?? 0) > 1,
+    // An alwaysCustom agent never shows the provider question — askChoice
+    // skips straight past it (see agent.alwaysCustom above) — regardless of
+    // how many internal templates its catalogue entry holds for
+    // findCustomTemplate to pick between. Junie is the first alwaysCustom
+    // agent with more than one, so this used to be true by coincidence for
+    // every alwaysCustom agent (OMP has exactly one provider); it is
+    // spelled out here now that a second one exists.
+    needsProvider: !agent.alwaysCustom && (agent.providers?.length ?? 0) > 1,
     alwaysCustom: agent.alwaysCustom === true,
   }));
   return [
@@ -688,7 +928,11 @@ export function agentProviders(agentId: string): ProviderSummary[] {
  *
  *  - A model call is always a POST. Agents also send connectivity probes, which
  *    would otherwise write an empty document at the top of the logs folder.
- *  - Anthropic counts tokens with a `count_tokens` path.
+ *  - The direct Anthropic API counts tokens with a `count_tokens` path.
+ *    Claude Code on Vertex AI reaches the same Anthropic wire format through a
+ *    Vertex-style URL instead, whose token-counting call ends
+ *    `:countTokens` — Vertex's own camelCase, colon-suffixed convention,
+ *    not Anthropic's underscored one — so both spellings are matched below.
  *  - Gemini counts tokens under a different name, and on the Google login route
  *    it fires several calls that carry no prompt at all. On that route the only
  *    calls worth keeping are the ones that generate content.
@@ -702,20 +946,73 @@ export function shouldLogRequest(
   // Case-insensitive on purpose: the streaming call is `:streamGenerateContent`,
   // with a capital G, and the non-streaming one is `:generateContent`.
   if (renderer === "gemini") return /generateContent/i.test(reqPath);
-  return !reqPath.includes("count_tokens");
+  // Matches both `count_tokens` (direct Anthropic API) and `countTokens`
+  // (Claude Code on Vertex AI).
+  return !/count[_-]?tokens/i.test(reqPath);
 }
 
 // ---------------------------------------------------------------------------
 // Resolution — the seam
 // ---------------------------------------------------------------------------
 
-function buildCommand(provider: ProviderEntry, baseUrl: string): string {
+function buildCommand(
+  provider: ProviderEntry,
+  baseUrl: string,
+  platform: NodeJS.Platform
+): string {
   const fill = (text: string) => text.replace(/\{baseUrl\}/g, baseUrl);
-  const env = (provider.env ?? []).map(([key, value]) => `${key}=${fill(value)}`);
+  const env = (provider.env ?? []).map(
+    ([key, value]) => [key, fill(value)] as const
+  );
   // Arguments take the base URL too. Codex has no variable for it, so its
   // whole override arrives as a flag.
   const args = (provider.args ?? []).map(fill);
-  return [...env, provider.bin, ...args].join(" ");
+  const bin = [provider.bin, ...args].join(" ");
+  return withEnv(env, bin, platform);
+}
+
+/**
+ * Join one or more `KEY=value` environment assignments onto the command that
+ * needs them, in whichever syntax the student's shell actually understands.
+ *
+ * POSIX shells — bash, zsh, and Windows' own WSL and Git Bash — accept
+ * `KEY=value KEY2=value2 bin` directly, so that is the default this tool has
+ * always printed. Windows' native PowerShell has no such syntax at all: typed
+ * back verbatim, it comes back as "is not recognized as a name of a cmdlet"
+ * (the report that prompted this function). PowerShell instead sets each
+ * variable with its own `$env:KEY = 'value'` statement, chained onto one
+ * line with semicolons the way PowerShell joins statements.
+ */
+function withEnv(
+  env: ReadonlyArray<readonly [string, string]>,
+  bin: string,
+  platform: NodeJS.Platform
+): string {
+  if (env.length === 0) return bin;
+  if (platform === "win32") {
+    return [
+      ...env.map(([key, value]) => `$env:${key} = ${powerShellQuote(value)}`),
+      bin,
+    ].join("; ");
+  }
+  return [...env.map(([key, value]) => `${key}=${value}`), bin].join(" ");
+}
+
+/** Quote one complete POSIX shell argument, including embedded single quotes. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+/**
+ * Quote one complete PowerShell string literal, including embedded single
+ * quotes (PowerShell escapes those by doubling them, not by backslash).
+ * Single-quoted PowerShell strings do no interpolation at all — unlike
+ * double-quoted ones, where a `$` in a base URL or a JSON config would be
+ * read as the start of a variable — so this is the literal, injection-safe
+ * quoting PowerShell offers.
+ */
+function powerShellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
 }
 
 /**
@@ -735,6 +1032,20 @@ function parseUpstreamUrl(raw: string): URL | null {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return null;
   return url;
+}
+
+/**
+ * The upstream a CustomTarget forwards to: origin plus any path prefix the
+ * student typed, e.g. https://opencode.ai/zen/go. A bare origin's pathname
+ * is "/", which collapses to nothing here so a path-free base URL still
+ * round-trips to exactly its origin. Any trailing slash on a typed prefix is
+ * dropped too, so proxy.ts can join this against a leading-slash request
+ * path (e.g. /v1/chat/completions) with plain concatenation and never
+ * produce a doubled or missing slash.
+ */
+function upstreamBaseUrlWithPath(url: URL): string {
+  const prefix = url.pathname.replace(/\/+$/, "");
+  return `${url.origin}${prefix}`;
 }
 
 /**
@@ -765,6 +1076,65 @@ function findCustomTemplate(
 }
 
 /**
+ * The note shown whenever a custom target's wire format is "raw" — the
+ * student said they were not sure, so every capture falls back to a JSON
+ * dump. Every custom-target route says this the same way, so it is written
+ * once here rather than copied into each one.
+ */
+const RAW_WIRE_FORMAT_NOTE =
+  'You picked "not sure" for the wire format, so every capture falls ' +
+  "back to a raw JSON dump instead of a fully rendered one. That is " +
+  "not broken — it is just less readable. Run with --force and pick a " +
+  "format once you know it, and the readable renderer takes over.";
+
+/**
+ * Whether a custom target for this agent and wire format needs a model
+ * declared up front, rather than being able to start against a bare base
+ * URL. The single source of truth both the wizard (config.ts, deciding
+ * whether to bother discovering one) and resolveCustomTarget (deciding
+ * whether to require one) consult, so a third agent that needs this only
+ * ever means one edit, here.
+ *
+ * - OpenCode only needs one for its OpenAI-compatible route: that is the
+ *   one built from an ephemeral provider with no catalogue entry to borrow
+ *   a model from. Its Anthropic-compatible route borrows a real Anthropic
+ *   provider instead, whose model names are real Anthropic model names.
+ * - Pi needs one on every route: every one of its custom targets overrides
+ *   an existing built-in provider (openai or anthropic), and that
+ *   provider's built-in model names almost never exist on a self-hosted
+ *   backend, whichever wire format was chosen for rendering.
+ */
+export function customTargetNeedsModel(
+  agentId: string,
+  renderer: RendererId
+): boolean {
+  if (agentId === "pi") return true;
+  if (agentId === "opencode") return renderer === "openai";
+  return false;
+}
+
+/**
+ * Read the model the wizard asked for, or the error both routes that need
+ * one return when it is missing — a remembered choice saved before this
+ * field existed, say, or one edited by hand. Shared so the two routes that
+ * call customTargetNeedsModel report the same shape of error, differing
+ * only in which target they name.
+ */
+function resolveCustomModel(
+  choice: AgentChoice,
+  targetLabel: string
+): { kind: "model"; model: string } | ResolveError {
+  const model = choice.customModel?.trim();
+  if (!model) {
+    return {
+      kind: "error",
+      message: `${targetLabel} needs a model ID. Run with --force to choose again.`,
+    };
+  }
+  return { kind: "model", model };
+}
+
+/**
  * Build a target from what the student typed, in place of a catalogue
  * lookup. The only facts on hand are the base URL and the wire format they
  * chose; everything else is borrowed from the closest matching catalogue
@@ -773,7 +1143,8 @@ function findCustomTemplate(
 function resolveCustomTarget(
   agent: AgentEntry,
   choice: AgentChoice,
-  port: number
+  port: number,
+  platform: NodeJS.Platform
 ): Resolution {
   if (!choice.customBaseUrl) {
     return {
@@ -797,30 +1168,128 @@ function resolveCustomTarget(
   const template = findCustomTemplate(agent, renderer);
   const baseUrl = `http://localhost:${port}${template?.suffix ?? ""}`;
 
+  if (agent.id === "opencode" && customTargetNeedsModel(agent.id, renderer)) {
+    const modelResult = resolveCustomModel(
+      choice,
+      "OpenCode's custom OpenAI-compatible target"
+    );
+    if (modelResult.kind === "error") return modelResult;
+    const { model } = modelResult;
+
+    const providerId = "request-logger";
+    const selectedModel = `${providerId}/${model}`;
+    const config = JSON.stringify({
+      model: selectedModel,
+      small_model: selectedModel,
+      provider: {
+        [providerId]: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Request Logger",
+          options: { baseURL: baseUrl },
+          models: { [model]: { name: model } },
+        },
+      },
+    });
+
+    return {
+      kind: "custom-target",
+      agent: agent.id,
+      agentLabel: agent.label,
+      providerLabel: CUSTOM_LABEL,
+      upstreamBaseUrl: upstreamBaseUrlWithPath(upstream),
+      renderer,
+      baseUrl,
+      command:
+        platform === "win32"
+          ? `$env:OPENCODE_CONFIG_CONTENT = ${powerShellQuote(config)}; opencode`
+          : `OPENCODE_CONFIG_CONTENT=${shellQuote(config)} opencode`,
+      setup: [],
+      notes: [
+        "This temporary provider is merged with your existing OpenCode " +
+          "configuration for this run only; your config file is not changed.",
+      ],
+      warnings: [],
+    };
+  }
+
+  /**
+   * Pi's custom target, on every wire format — unlike OpenCode's branch
+   * above, which only fires for the OpenAI-compatible choice. Pi always
+   * writes a models.json override for a custom base URL (see piModels), and
+   * that override always replaces one of Pi's built-in providers, whose
+   * built-in model names (gpt-4o, claude-*) almost never exist on a
+   * self-hosted backend regardless of which wire format the student picked
+   * for rendering. So a model is required here every time, not just for one
+   * renderer.
+   */
+  if (agent.id === "pi" && customTargetNeedsModel(agent.id, renderer)) {
+    const modelResult = resolveCustomModel(choice, "Pi's custom target");
+    if (modelResult.kind === "error") return modelResult;
+    const { model } = modelResult;
+
+    // template is the anthropic or openai Pi provider entry (see
+    // findCustomTemplate). Every renderer this branch can be reached with
+    // ("openai", "anthropic", "raw") has a Pi provider tagged for it — see
+    // the catalogue above — so this can only be missing if a future wire
+    // format is added there without a matching Pi template.
+    if (!template) {
+      return {
+        kind: "error",
+        message:
+          `Pi has no custom-target template for the "${renderer}" wire ` +
+          `format. Run with --force to choose again.`,
+      };
+    }
+    // template.id is the provider key Pi's built-in catalogue uses, which
+    // is also the key this override replaces.
+    const providerId = template.id;
+    const notes = [
+      `This models.json entry replaces Pi's built-in "${providerId}" model ` +
+        "catalogue with the one model you selected, since Pi's built-in " +
+        "model names almost never exist on a custom server.",
+    ];
+    if (renderer === "anthropic") {
+      notes.push(
+        "Model discovery only checks the OpenAI-style /v1/models listing " +
+          "endpoint, which an Anthropic-compatible server often does not " +
+          "expose. If discovery found nothing here and you typed the model " +
+          "ID by hand, that is expected — it does not mean the ID is wrong."
+      );
+    }
+    if (renderer === "raw") notes.push(RAW_WIRE_FORMAT_NOTE);
+
+    return {
+      kind: "custom-target",
+      agent: agent.id,
+      agentLabel: agent.label,
+      providerLabel: CUSTOM_LABEL,
+      upstreamBaseUrl: upstreamBaseUrlWithPath(upstream),
+      renderer,
+      baseUrl,
+      command: buildCommand(template, baseUrl, platform),
+      setup: [piModels(providerId, baseUrl, model)],
+      notes,
+      warnings: template.warnings ?? [],
+    };
+  }
+
   const notes = [
     `This command is built from ${agent.label}'s own setup pattern, since a ` +
       `custom target has no dedicated one of its own. If a note below assumes ` +
       `a specific login or account, it may not apply to your target.`,
     ...(template?.notes ?? []),
   ];
-  if (renderer === "raw") {
-    notes.push(
-      'You picked "not sure" for the wire format, so every capture falls ' +
-        "back to a raw JSON dump instead of a fully rendered one. That is " +
-        "not broken — it is just less readable. Run with --force and pick a " +
-        "format once you know it, and the readable renderer takes over."
-    );
-  }
+  if (renderer === "raw") notes.push(RAW_WIRE_FORMAT_NOTE);
 
   return {
     kind: "custom-target",
     agent: agent.id,
     agentLabel: agent.label,
     providerLabel: CUSTOM_LABEL,
-    upstreamBaseUrl: upstream.origin,
+    upstreamBaseUrl: upstreamBaseUrlWithPath(upstream),
     renderer,
     baseUrl,
-    command: template ? buildCommand(template, baseUrl) : agent.id,
+    command: template ? buildCommand(template, baseUrl, platform) : agent.id,
     setup: (template?.setup ?? []).map((file) => ({
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
@@ -834,12 +1303,16 @@ function resolveCustomTarget(
  * Turn a saved choice into everything the tool needs, or into a clear reason
  * why it cannot.
  *
- * Pure: no disk, no network, no clock. Give it the same choice and the same
- * port and it gives back the same answer.
+ * Pure: no disk, no network, no clock. Give it the same choice, the same
+ * port and the same platform and it gives back the same answer. `platform`
+ * decides only the shell syntax of the printed command — POSIX `KEY=value
+ * bin` everywhere except win32, where PowerShell needs `$env:KEY = 'value'`
+ * statements instead (see withEnv). The caller reads `process.platform`
+ * once and passes it in, the same way it already does for `port`.
  */
 export function resolveChoice(
   choice: AgentChoice,
-  options: { port: number }
+  options: { port: number; platform: NodeJS.Platform }
 ): Resolution {
   const agent = AGENTS.find((a) => a.id === choice.agent);
 
@@ -877,7 +1350,7 @@ export function resolveChoice(
   // provider question, or because every setup for this agent is custom
   // (alwaysCustom, e.g. OMP), which never shows that question at all.
   if (agent.alwaysCustom || choice.provider === CUSTOM_ID) {
-    return resolveCustomTarget(agent, choice, options.port);
+    return resolveCustomTarget(agent, choice, options.port, options.platform);
   }
 
   let provider: ProviderEntry | undefined;
@@ -916,7 +1389,7 @@ export function resolveChoice(
     upstreamHost: provider.upstreamHost,
     renderer: provider.renderer,
     baseUrl,
-    command: buildCommand(provider, baseUrl),
+    command: buildCommand(provider, baseUrl, options.platform),
     setup: (provider.setup ?? []).map((file) => ({
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
