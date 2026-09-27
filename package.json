@@ -1,0 +1,22 @@
+{
+  "name": "request-logger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Intercepting proxy that logs coding-agent requests; forked for match/replace work",
+  "scripts": {
+    "request-logger": "tsx proxy.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4.19.4",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.3"
+  }
+}
