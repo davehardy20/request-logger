@@ -164,6 +164,8 @@ Things worth knowing:
   on-disk capture of a response keeps at most the first 8 MiB — a
   per-stream budget, so several concurrent streams stay bounded — and says
   so on the console when it truncates; every byte still reaches the agent.
+  (One exception: a buffered response past the rewrite size cap is forwarded
+  untouched, and its capture is a note instead of the body.)
   Request captures are never capped: the request is already in memory to be
   forwarded, and a complete, replayable `.request.txt` is one of this tool's
   promises. One pathological body cannot eat the process.

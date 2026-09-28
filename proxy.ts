@@ -253,7 +253,9 @@ export function handle(
         encKind !== "" &&
         encKind !== "identity" &&
         !streamingDecoder;
-      if (sseEncodingUnreadable) {
+      // Only worth warning when rules exist: with no response rules the
+      // stream is forwarded verbatim either way and the warning is noise.
+      if (sseEncodingUnreadable && responseRules.length > 0) {
         console.warn(
           `[request-logger] SSE response arrived ${encKind}-compressed; this tool has no streaming decoder for it, so the stream passes through untouched.`
         );
@@ -316,13 +318,11 @@ export function handle(
         delete headers["transfer-encoding"];
         // Streaming mode rewrites bytes on the fly, so validators that
         // describe the original body cannot be trusted even before a match
-        // is seen: drop them whenever response rules are active (the same
-        // reasoning as the buffered path's bytes-changed case).
-        if (responseRules.length > 0) {
-          delete headers.etag;
-          delete headers.digest;
-          delete headers["content-md5"];
-        }
+        // is seen: drop them, the same reasoning as the buffered path's
+        // bytes-changed case. (Rules are known active here — canRewrite.)
+        delete headers.etag;
+        delete headers.digest;
+        delete headers["content-md5"];
         // An upstream that compresses despite the stripped accept-encoding
         // (rare, but it happens) must not feed the rewriter compressed
         // bytes: it would find no matches and pass the rules by silently.
