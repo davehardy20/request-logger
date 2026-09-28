@@ -651,18 +651,24 @@ let burstState: BurstState | null = null;
  * promises.
  */
 function responseForCapture(c: Capture): Buffer {
-  const oversized = c.responseCaptureDropped === true || c.responseRaw.length > CAPTURE_LIMIT_BYTES;
-  const text = c.responseRaw.length > CAPTURE_LIMIT_BYTES
-    ? c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES)
-    : c.responseRaw;
-  if (oversized) {
-    console.log(
-      dim(
-        "[request-logger] response passed the capture size cap; the capture keeps the first part only."
-      )
-    );
-  }
-  return Buffer.from(text, "utf8");
+  // Count encoded bytes, not string characters: a multibyte-heavy response
+  // can be three bytes per character, and the budget is bytes.
+  const oversized =
+    c.responseCaptureDropped === true ||
+    Buffer.byteLength(c.responseRaw, "utf8") > CAPTURE_LIMIT_BYTES;
+  if (!oversized) return Buffer.from(c.responseRaw, "utf8");
+  console.log(
+    dim(
+      "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+    )
+  );
+  // Cut to the budget on a character boundary: take at most CAP characters
+  // (a transient of at most 3x budget), then trim to the byte budget without
+  // splitting a multi-byte character.
+  const head = Buffer.from(c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES), "utf8");
+  let cut = Math.min(CAPTURE_LIMIT_BYTES, head.length);
+  while (cut > 0 && (head[cut] & 0xc0) === 0x80) cut--;
+  return head.subarray(0, cut);
 }
 
 function writeCapture(c: Capture): void {
