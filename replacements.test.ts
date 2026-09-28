@@ -266,7 +266,7 @@ describe("contentTypeIsTextish", () => {
 
 describe("caps (RewriteLimits)", () => {
   it("abandons an expansionary rewrite whole when the output cap is exceeded", () => {
-    const tiny = { decoded: 1024, input: 1024, output: 32 };
+    const tiny = { decoded: 1024, input: 1024, output: 32, carry: 1024 };
     const result = applyReplacements(
       "aaaaaaaaaaaaaaaa",
       [{ match: "a", replace: "aaaaaaaaaa" }],
@@ -277,7 +277,7 @@ describe("caps (RewriteLimits)", () => {
   });
 
   it("passes a body larger than the input cap through untouched", () => {
-    const tiny = { decoded: 1024, input: 8, output: 1024 };
+    const tiny = { decoded: 1024, input: 8, output: 1024, carry: 1024 };
     const body = Buffer.from("deny deny deny deny");
     const { body: out, count } = rewriteBody(
       body,
@@ -290,7 +290,7 @@ describe("caps (RewriteLimits)", () => {
   });
 
   it("passes a compressed body that would decompress past the cap through compressed, untouched", () => {
-    const tiny = { decoded: 256, input: 65536, output: 65536 };
+    const tiny = { decoded: 256, input: 65536, output: 65536, carry: 1024 };
     // 4096 zero bytes gzip to a few dozen; the decoded size is what trips the cap.
     const bomb = zlib.gzipSync(Buffer.alloc(4096));
     const {
@@ -408,5 +408,52 @@ describe("makeStreamRewriter boundary correctness (Greptile round 2)", () => {
     const joined = Buffer.concat([first, second, third, tail]);
     expect(joined.toString("latin1")).toBe("XXallow YYYYéabcdef");
     expect(joined.indexOf("YYYY")).toBeLessThan(joined.indexOf("abcdef"));
+  });
+});
+
+describe("makeStreamRewriter carry cap (Greptile round 3)", () => {
+  it("keeps making progress on a pathological prefix run, and still rewrites a match that completes inside the carry window", () => {
+    // Rule aab->x against a long run of "a": every suffix of the run is a
+    // genuine match start, so an unbounded rewriter would hold the whole
+    // run forever. With carry capped at 8 bytes, bytes must keep flowing
+    // out — and a match that completes within 8 bytes of the frontier is
+    // still rewritten, because it never left the carry.
+    const tiny = { decoded: 1024, input: 1024, output: 1024, carry: 8 };
+    const rewriter = makeStreamRewriter([{ match: "aab", replace: "x" }], tiny);
+    const out1 = rewriter.push(Buffer.from("a".repeat(64)));
+    expect(out1.length).toBeGreaterThan(0); // progress, not an unbounded hold
+    const out2 = rewriter.push(Buffer.from("b")); // the match completes late
+    const tail = rewriter.flush();
+    // 64 a's + b: "aab" completes 1 byte past the frontier, inside the
+    // carry, so it rewrites: 62 a's survive and "aab" became "x".
+    const expected = `${"a".repeat(62)}x`;
+    expect(Buffer.concat([out1, out2, tail]).toString("utf8")).toBe(expected);
+  });
+
+  it("lets a match spanning further than the carry cap go unrewritten, rather than withholding forever", () => {
+    // A 13-byte match against carry=8: holding the whole run for it would
+    // break the cap, so the run flows and the match escapes — the
+    // documented trade: progress beats completeness at the cap.
+    const tiny = { decoded: 1024, input: 1024, output: 1024, carry: 8 };
+    const long = `${"a".repeat(12)}b`;
+    const rewriter = makeStreamRewriter([{ match: long, replace: "HIT" }], tiny);
+    const out = [
+      rewriter.push(Buffer.from("a".repeat(64))),
+      rewriter.push(Buffer.from("b")),
+      rewriter.flush()
+    ];
+    expect(Buffer.concat(out).toString("utf8")).toBe(`${"a".repeat(64)}b`);
+    expect(rewriter.count()).toBe(0);
+  });
+
+  it("still rewrites an ordinary match with a small carry cap", () => {
+    const tiny = { decoded: 1024, input: 1024, output: 1024, carry: 8 };
+    const rewriter = makeStreamRewriter([{ match: "deny", replace: "allow" }], tiny);
+    const out = [
+      rewriter.push(Buffer.from("keep this: ")),
+      rewriter.push(Buffer.from("deny please")),
+      rewriter.flush()
+    ];
+    expect(Buffer.concat(out).toString("utf8")).toBe("keep this: allow please");
   });
 });

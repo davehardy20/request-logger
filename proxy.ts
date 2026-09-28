@@ -36,6 +36,7 @@ import { renderMarkdown } from "./render";
 import {
   contentTypeIsSse,
   contentTypeIsTextish,
+  DEFAULT_LIMITS,
   loadReplacements,
   makeStreamRewriter,
   type ReplacementRule,
@@ -74,6 +75,15 @@ export function resetLogDir(): void {
 // without a restart. Missing or empty file = zero rules = byte-for-byte
 // pass-through, exactly as this tool behaved before the feature existed.
 const REPLACEMENTS_FILE = path.join(HERE, "replacements.json");
+
+/**
+ * Size caps for response handling, shared by every path below: rewriting
+ * stops past the decoded cap, and the capture never keeps more than
+ * CAPTURE_LIMIT_BYTES of a stream. `decoded` comes from the replacements
+ * module so one body obeys one budget everywhere.
+ */
+const PROXY_LIMITS = { decoded: DEFAULT_LIMITS.decoded };
+const CAPTURE_LIMIT_BYTES = 1024 * 1024;
 
 /** A header value, when Node reports it as one value or many. */
 function header(value: string | string[] | undefined): string | undefined {
@@ -257,9 +267,15 @@ export function handle(
       // before match-and-replace existed.
       if (!canRewrite) {
         res.writeHead(statusCode, upstreamRes.headers);
+        // The capture keeps at most CAPTURE_LIMIT_BYTES of a stream that may
+        // never end; the bytes themselves still all flow through.
         const responseChunks: Buffer[] = [];
+        let captured = 0;
         upstreamRes.on("data", (chunk: Buffer) => {
-          responseChunks.push(chunk);
+          if (captured < CAPTURE_LIMIT_BYTES) {
+            responseChunks.push(chunk);
+            captured += chunk.length;
+          }
           res.write(chunk); // stream straight back to the agent, unbuffered
         });
         upstreamRes.on("end", () => {
@@ -296,31 +312,38 @@ export function handle(
         // (rare, but it happens) must not feed the rewriter compressed
         // bytes: it would find no matches and pass the rules by silently.
         // Decode the stream on the way through and send it on as identity.
+        // Validators that describe the compressed representation (ETag,
+        // Digest, Content-MD5) no longer describe what the agent receives,
+        // so they go the same way as on the buffered path.
         let source: NodeJS.ReadableStream = upstreamRes;
         if (encKind !== "" && encKind !== "identity" && streamingDecoder) {
           const decoder = streamingDecoder();
-          decoder.on("error", (err) => {
-            console.error(`[request-logger] SSE decode error: ${err.message}`);
-            res.end();
-          });
           source = upstreamRes.pipe(decoder);
           delete headers["content-encoding"];
+          delete headers.etag;
+          delete headers.digest;
+          delete headers["content-md5"];
         }
         res.writeHead(statusCode, headers);
+        // A stream can outlive any buffer: the capture keeps at most
+        // CAPTURE_LIMIT_BYTES of it, and rewriting stops (with the withheld
+        // tail flushed, in order) once the decoded stream passes the
+        // decoded cap. Progress and bounded memory beat completeness on a
+        // stream that was never going to be reasonably rewritable anyway.
         const written: Buffer[] = [];
-        source.on("data", (chunk: Buffer) => {
-          const out = rewriter.push(chunk);
-          if (out.length > 0) {
+        let captured = 0;
+        let fed = 0;
+        let rewriteAbandoned = false;
+        const push = (out: Buffer): void => {
+          res.write(out);
+          if (captured < CAPTURE_LIMIT_BYTES) {
             written.push(out);
-            res.write(out);
+            captured += out.length;
           }
-        });
-        source.on("end", () => {
+        };
+        const finish = (): void => {
           const tail = rewriter.flush();
-          if (tail.length > 0) {
-            written.push(tail);
-            res.write(tail);
-          }
+          if (tail.length > 0) push(tail);
           res.end();
           writeCapture({
             base,
@@ -336,6 +359,32 @@ export function handle(
             requestReplacements,
             responseReplacements: rewriter.count(),
           });
+        };
+        source.on("data", (chunk: Buffer) => {
+          fed += chunk.length;
+          if (rewriteAbandoned) {
+            push(chunk);
+            return;
+          }
+          if (fed > PROXY_LIMITS.decoded) {
+            rewriteAbandoned = true;
+            console.warn(
+              "[request-logger] SSE stream passed the rewrite size cap; rewriting stops, the rest passes through untouched."
+            );
+            const tail = rewriter.flush();
+            if (tail.length > 0) push(tail);
+            push(chunk);
+            return;
+          }
+          const out = rewriter.push(chunk);
+          if (out.length > 0) push(out);
+        });
+        source.on("end", finish);
+        source.on("error", (err: Error) => {
+          // A truncated or corrupt compressed stream: flush what was
+          // withheld, close cleanly, and still write the capture.
+          console.error(`[request-logger] SSE stream error: ${err.message}`);
+          finish();
         });
         return;
       }
@@ -343,16 +392,57 @@ export function handle(
       // Everything else is a whole body: buffer it, because a match can
       // straddle chunks, so none of the body is safe to send until all of
       // it is read. The agent's streaming is traded for a correct rewrite,
-      // and only while response rules exist. Nothing matched: the response
-      // is forwarded exactly as it arrived, headers and all. Something
-      // matched: lengths and digests that described the original bytes
-      // (content-length, ETag, Digest, Content-MD5) would misdescribe the
-      // rewritten ones, so length is recomputed and the digests dropped; the
-      // declared content-encoding stays true because rewriteBody
-      // re-compresses with the same algorithm.
+      // and only while response rules exist. A body that outgrows the
+      // rewrite cap mid-buffer stops being buffered: headers go out as they
+      // arrived, what was already read is written straight through, and the
+      // rest streams — a body too big to rewrite is still a body the agent
+      // must receive. Nothing matched: the response is forwarded exactly as
+      // it arrived, headers and all. Something matched: lengths and digests
+      // that described the original bytes (content-length, ETag, Digest,
+      // Content-MD5) would misdescribe the rewritten ones, so length is
+      // recomputed and the digests dropped; the declared content-encoding
+      // stays true because rewriteBody re-compresses with the same algorithm.
       const responseChunks: Buffer[] = [];
-      upstreamRes.on("data", (chunk: Buffer) => responseChunks.push(chunk));
+      let oversized = false;
+      upstreamRes.on("data", (chunk: Buffer) => {
+        if (oversized) {
+          res.write(chunk);
+          return;
+        }
+        if (
+          responseChunks.reduce((n, b) => n + b.length, 0) + chunk.length >
+          PROXY_LIMITS.decoded
+        ) {
+          oversized = true;
+          console.warn(
+            "[request-logger] response body passed the rewrite size cap; it is forwarded untouched instead of rewritten."
+          );
+          res.writeHead(statusCode, upstreamRes.headers);
+          for (const buffered of responseChunks) res.write(buffered);
+          res.write(chunk);
+          return;
+        }
+        responseChunks.push(chunk);
+      });
       upstreamRes.on("end", () => {
+        if (oversized) {
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: "(response exceeded the rewrite size cap; forwarded untouched, not captured)",
+            requestReplacements,
+            responseReplacements: 0,
+          });
+          return;
+        }
         const raw = Buffer.concat(responseChunks);
         const rewritten = rewriteBody(
           raw,

@@ -699,3 +699,53 @@ describe("compressed SSE (Greptile round 2)", () => {
     expect(await response.text()).toBe("data: deny it\n\n");
   });
 });
+
+describe("SSE hardening (Greptile round 3)", () => {
+  it("drops stale validators when decoding a compressed SSE stream to identity", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-encoding": "gzip",
+        etag: '"compressed-bytes-v1"'
+      });
+      res.end(zlib.gzipSync(Buffer.from("data: deny\n\n")));
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    expect(response.headers.get("etag")).toBeNull();
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(await response.text()).toBe("data: allow\n\n");
+  });
+
+  it("ends the client response and still captures when a compressed SSE stream is corrupt", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-encoding": "gzip"
+      });
+      res.write(Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00])); // gzip magic, then garbage
+      res.end(Buffer.from("not really gzip"));
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    // Must resolve, not hang: the decoder error is turned into a clean end.
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+  });
+});

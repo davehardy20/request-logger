@@ -155,14 +155,22 @@ Things worth knowing:
   everything streams back unbuffered as before.
 - Rewriting is bounded. A compressed body that would decompress past 64 MiB is
   passed through still compressed; a body larger than 64 MiB is never
-  rewritten; and a rule set whose combined output would grow past 256 MiB
-  (longer replacements than matches) is abandoned whole — the original text
-  comes back. One pathological body cannot eat the process.
+  rewritten (an oversized buffered response switches mid-flight to untouched
+  forwarding, headers and all); a rule set whose combined output would grow
+  past 256 MiB (longer replacements than matches) is abandoned whole — the
+  original text comes back; and the SSE rewriter never withholds more than
+  1 MiB waiting for a match to complete, so a pathological stream keeps
+  flowing even if a match spanning further than that goes unrewritten. The
+  on-disk capture keeps at most the first 1 MiB of a stream that never ends.
+  One pathological body cannot eat the process.
 - When a rewrite changes the bytes, headers that described the original bytes
   stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
-  `Content-MD5` are dropped. Nothing matched, and the response is forwarded
-  exactly as it arrived — headers and all. Bodyless responses (HEAD, 204,
-  304) are never touched, keeping their `Content-Length`.
+  `Content-MD5` are dropped. The same validators are dropped when a
+  compressed SSE stream is decoded and forwarded as identity — the delivered
+  bytes are no longer the described ones even if no rule matched. Nothing
+  matched, and the response is forwarded exactly as it arrived — headers and
+  all. Bodyless responses (HEAD, 204, 304) are never touched, keeping their
+  `Content-Length`.
 - A malformed rules file never takes traffic down: invalid JSON or invalid
   rules are reported once and skipped, and everything else passes through.
 - The log files show the traffic as rewritten — what actually went up and came

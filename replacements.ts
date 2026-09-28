@@ -171,13 +171,16 @@ export interface RewriteLimits {
   input: number;
   /** A rewrite whose output would grow past this is abandoned; the original text comes back. */
   output: number;
+  /** Max bytes the stream rewriter may withhold waiting for a match to complete. */
+  carry: number;
 }
 
 /** Caps sized for a single-user local proxy: generous, but never unbounded. */
 export const DEFAULT_LIMITS: RewriteLimits = {
   decoded: 64 * 1024 * 1024,
   input: 64 * 1024 * 1024,
-  output: 256 * 1024 * 1024
+  output: 256 * 1024 * 1024,
+  carry: 1024 * 1024
 };
 
 /** Decompressors for the encodings this module can rewrite, all bounded by the decoded cap. */
@@ -342,12 +345,18 @@ export function makeStreamRewriter(
    * of a match whose remainder has not arrived yet. Zero means the region
    * ends cleanly and is safe to emit.
    */
+  /** Longest match, so partialMatchSuffix only ever needs the last (maxMatch-1) bytes. */
+  const maxMatch = matchBuffers.reduce((n, m) => Math.max(n, m.length), 0);
+
   function partialMatchSuffix(bytes: Buffer): number {
+    // Only a proper prefix of a match can be the problem, and prefixes are at
+    // most maxMatch-1 bytes long — so only the tail of the region can matter.
+    const window = bytes.subarray(Math.max(0, bytes.length - (maxMatch - 1)));
     let best = 0;
     for (const match of matchBuffers) {
-      const take = Math.min(match.length - 1, bytes.length);
+      const take = Math.min(match.length - 1, window.length);
       for (let n = take; n > best; n--) {
-        if (bytes.subarray(bytes.length - n).equals(match.subarray(0, n))) {
+        if (window.subarray(window.length - n).equals(match.subarray(0, n))) {
           best = n;
           break;
         }
@@ -388,8 +397,17 @@ export function makeStreamRewriter(
       // An emitted region must never END with the start of a match: a match
       // straddling the emitted/withheld boundary would have its first half
       // gone for good and could never be rewritten. Withhold byte by byte
-      // until the region's suffix is not a proper prefix of any match.
+      // until the region's suffix is not a proper prefix of any match — but
+      // never withhold more than the carry cap. A pathological stream (a
+      // rule like aab->x against a megabyte of "a") could otherwise hold the
+      // whole run forever: correctness gives way to progress at the cap, and
+      // a match spanning more than the cap simply goes unrewritten.
+      const floor = combined.length - limits.carry;
       for (;;) {
+        if (floor > 0 && cut < floor) {
+          cut = floor;
+          break;
+        }
         const overlap = partialMatchSuffix(combined.subarray(0, cut));
         if (overlap === 0) break;
         cut -= overlap;
