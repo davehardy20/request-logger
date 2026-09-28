@@ -78,12 +78,13 @@ const REPLACEMENTS_FILE = path.join(HERE, "replacements.json");
 
 /**
  * Size caps for response handling, shared by every path below: rewriting
- * stops past the decoded cap, and the capture never keeps more than
- * CAPTURE_LIMIT_BYTES of a stream. `decoded` comes from the replacements
- * module so one body obeys one budget everywhere.
+ * stops past the decoded cap, and the capture never keeps more than that
+ * same cap of a stream that may never end (a console note says so when it
+ * happens). `decoded` comes from the replacements module so one body obeys
+ * one budget everywhere.
  */
 const PROXY_LIMITS = { decoded: DEFAULT_LIMITS.decoded };
-const CAPTURE_LIMIT_BYTES = 1024 * 1024;
+const CAPTURE_LIMIT_BYTES = DEFAULT_LIMITS.decoded;
 
 /** A header value, when Node reports it as one value or many. */
 function header(value: string | string[] | undefined): string | undefined {
@@ -271,10 +272,18 @@ export function handle(
         // never end; the bytes themselves still all flow through.
         const responseChunks: Buffer[] = [];
         let captured = 0;
+        let truncationNoted = false;
         upstreamRes.on("data", (chunk: Buffer) => {
           if (captured < CAPTURE_LIMIT_BYTES) {
             responseChunks.push(chunk);
             captured += chunk.length;
+          } else if (!truncationNoted) {
+            truncationNoted = true;
+            console.log(
+              dim(
+                "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+              )
+            );
           }
           res.write(chunk); // stream straight back to the agent, unbuffered
         });
@@ -332,6 +341,16 @@ export function handle(
         // stream that was never going to be reasonably rewritable anyway.
         const written: Buffer[] = [];
         let captured = 0;
+        let truncationNoted = false;
+        const note = (): void => {
+          if (truncationNoted) return;
+          truncationNoted = true;
+          console.log(
+            dim(
+              "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+            )
+          );
+        };
         let fed = 0;
         let rewriteAbandoned = false;
         const push = (out: Buffer): void => {
@@ -339,6 +358,8 @@ export function handle(
           if (captured < CAPTURE_LIMIT_BYTES) {
             written.push(out);
             captured += out.length;
+          } else {
+            note();
           }
         };
         const finish = (): void => {
@@ -403,16 +424,14 @@ export function handle(
       // recomputed and the digests dropped; the declared content-encoding
       // stays true because rewriteBody re-compresses with the same algorithm.
       const responseChunks: Buffer[] = [];
+      let buffered = 0;
       let oversized = false;
       upstreamRes.on("data", (chunk: Buffer) => {
         if (oversized) {
           res.write(chunk);
           return;
         }
-        if (
-          responseChunks.reduce((n, b) => n + b.length, 0) + chunk.length >
-          PROXY_LIMITS.decoded
-        ) {
+        if (buffered + chunk.length > PROXY_LIMITS.decoded) {
           oversized = true;
           console.warn(
             "[request-logger] response body passed the rewrite size cap; it is forwarded untouched instead of rewritten."
@@ -423,6 +442,7 @@ export function handle(
           return;
         }
         responseChunks.push(chunk);
+        buffered += chunk.length;
       });
       upstreamRes.on("end", () => {
         if (oversized) {
