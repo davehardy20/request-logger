@@ -341,16 +341,6 @@ export function handle(
         // stream that was never going to be reasonably rewritable anyway.
         const written: Buffer[] = [];
         let captured = 0;
-        let truncationNoted = false;
-        const note = (): void => {
-          if (truncationNoted) return;
-          truncationNoted = true;
-          console.log(
-            dim(
-              "[request-logger] response passed the capture size cap; the capture keeps the first part only."
-            )
-          );
-        };
         let fed = 0;
         let rewriteAbandoned = false;
         const push = (out: Buffer): void => {
@@ -358,8 +348,6 @@ export function handle(
           if (captured < CAPTURE_LIMIT_BYTES) {
             written.push(out);
             captured += out.length;
-          } else {
-            note();
           }
         };
         const finish = (): void => {
@@ -652,6 +640,17 @@ export function trackBurst(
 /** Module-level on purpose: one guard for the whole process, the same as LOG_DIR. */
 let burstState: BurstState | null = null;
 
+/** A capture on disk never exceeds the per-capture budget, whatever the wire did. */
+function cappedForCapture(bytes: Buffer, what: string): Buffer {
+  if (bytes.length <= CAPTURE_LIMIT_BYTES) return bytes;
+  console.log(
+    dim(
+      `[request-logger] ${what} passed the capture size cap; the capture keeps the first part only.`
+    )
+  );
+  return bytes.subarray(0, CAPTURE_LIMIT_BYTES);
+}
+
 function writeCapture(c: Capture): void {
   const label = c.target.agentLabel;
 
@@ -663,6 +662,7 @@ function writeCapture(c: Capture): void {
     );
     return;
   }
+
 
   const burst = trackBurst(
     burstState,
@@ -704,9 +704,15 @@ function writeCapture(c: Capture): void {
     // The .request/.response files keep the bytes that were actually
     // forwarded upstream and returned to the agent — rewritten, if
     // match-and-replace rules matched — so a capture replays what really
-    // went over the wire. Only the .md is decoded.
-    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), c.requestBody);
-    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), c.responseRaw);
+    // went over the wire. Only the .md is decoded. Both are capped at the
+    // per-capture budget: a response between the budget and the rewrite cap
+    // must not write a capture several times larger than documented, and an
+    // expansionary rule set cannot inflate the file past it either. The
+    // .md renders from the same capped bytes.
+    const capturedRequest = cappedForCapture(c.requestBody, "request");
+    const capturedResponse = cappedForCapture(Buffer.from(c.responseRaw, "utf8"), "response");
+    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), capturedRequest);
+    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), capturedResponse);
     fs.writeFileSync(
       path.join(LOG_DIR, `${c.base}.md`),
       renderMarkdown({
@@ -717,9 +723,9 @@ function writeCapture(c: Capture): void {
         path: c.path,
         statusCode: c.statusCode,
         headers: c.headers,
-        requestBody: c.requestBody,
+        requestBody: capturedRequest,
         requestEncoding: c.requestEncoding,
-        responseRaw: c.responseRaw,
+        responseRaw: capturedResponse.toString("utf8"),
       })
     );
     console.log(
