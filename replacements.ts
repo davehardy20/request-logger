@@ -145,7 +145,34 @@ export interface Replaced {
  * abandoned whole — the original text comes back with count 0, because
  * half-rewritten text would be worse than none.
  */
-const surrogatePattern = /[\uD800-\uDFFF]/;
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+/**
+ * Encoded UTF-8 byte length of `out` after replacing every occurrence of a
+ * rule's match with `replace`, counted from the split segments without
+ * materializing the result. A surrogate pair can form at an insertion
+ * boundary — the text's last char before the insertion being a high
+ * surrogate with the replacement's first a low one, or the replacement's
+ * last a high with the following text's first a low — and each such pair
+ * encodes 2 bytes fewer than the two characters would separately.
+ */
+function estimateRuleOutput(segs: string[], hits: number, replace: string): number {
+  const repFirstIsLow = isLowSurrogate(replace.charCodeAt(0));
+  const repLastIsHigh = isHighSurrogate(replace.charCodeAt(replace.length - 1));
+  let bytes = hits * Buffer.byteLength(replace, "utf8");
+  for (let i = 0; i < segs.length; i++) {
+    bytes += Buffer.byteLength(segs[i], "utf8");
+    if (i >= hits) continue;
+    if (repFirstIsLow && isHighSurrogate(segs[i].charCodeAt(segs[i].length - 1))) {
+      bytes -= 2;
+    }
+    if (repLastIsHigh && isLowSurrogate(segs[i + 1].charCodeAt(0))) {
+      bytes -= 2;
+    }
+  }
+  return bytes;
+}
 
 export function applyReplacements(
   text: string,
@@ -156,27 +183,21 @@ export function applyReplacements(
   let count = 0;
   for (const rule of rules) {
     if (rule.match === "") continue;
-    const hits = out.split(rule.match).length - 1;
+    const segs = out.split(rule.match);
+    const hits = segs.length - 1;
     if (hits === 0) continue;
-    // Estimate the single-rule output length before materializing it:
-    // replaceAll would otherwise allocate the oversized string first and
-    // only then trip the cap. Splits are non-overlapping, so the estimate
-    // is exact — unless surrogate code units are in play: a high surrogate
-    // inserted here can pair with a low surrogate from a later rule and
-    // encode as one 4-byte character instead of two 3-byte ones, which
-    // would make the estimate overcount and skip a valid rewrite. When any
-    // surrogate is present, skip the pre-check; the post-check below
-    // remains the guard.
-    if (
-      !surrogatePattern.test(out) &&
-      !surrogatePattern.test(rule.match) &&
-      !surrogatePattern.test(rule.replace)
-    ) {
-      const estimate =
-        Buffer.byteLength(out, "utf8") +
-        hits * (Buffer.byteLength(rule.replace, "utf8") - Buffer.byteLength(rule.match, "utf8"));
-      if (estimate > limits.output) return { text, count: 0 };
-    }
+    // Exact pre-estimate of the single-rule output, so replaceAll never
+    // allocates an oversized string just to trip the post-check below.
+    // Splits are non-overlapping, and the only way the result can differ
+    // from segments-plus-replacements is a surrogate PAIR forming at an
+    // insertion boundary (a trailing high surrogate before an inserted
+    // low surrogate, or an inserted high before a following low): each
+    // pair encodes as one 4-byte character instead of two 3-byte ones,
+    // saving 2 bytes. Counting those keeps the estimate exact even for
+    // emoji-containing text, so nothing is skipped and nothing is
+    // over-bailed.
+    const estimate = estimateRuleOutput(segs, hits, rule.replace);
+    if (estimate > limits.output) return { text, count: 0 };
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
     if (out.length > limits.output || Buffer.byteLength(out, "utf8") > limits.output) {

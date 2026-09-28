@@ -301,6 +301,17 @@ describe("caps (RewriteLimits)", () => {
     expect(result.text).toBe("\uD83D\uDE00");
   });
 
+  it("does not skip the pre-estimate for emoji-containing text", () => {
+    // The estimate must stay exact (never skipped) when the TEXT contains
+    // surrogates: an expansionary rule on an emoji-containing body must
+    // still bail up front, not allocate past the cap first. "a\uD83D\uDE00"
+    // is 5 bytes; replacing "a" with "aaaa" yields 8 > 7.
+    const caps = { decoded: 1024, input: 1024, output: 7, carry: 1024 };
+    const result = applyReplacements("a\uD83D\uDE00", [{ match: "a", replace: "aaaa" }], caps);
+    expect(result.count).toBe(0);
+    expect(result.text).toBe("a\uD83D\uDE00");
+  });
+
   it("still abandons the rewrite when the true surrogate output exceeds the cap", () => {
     const caps = { decoded: 1024, input: 1024, output: 3, carry: 1024 };
     const result = applyReplacements(
