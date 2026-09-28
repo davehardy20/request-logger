@@ -226,14 +226,21 @@ export function rewriteBody(
     plain = decoded;
   }
 
-  const { text, count } = applyReplacements(plain.toString("utf8"), rules);
+  // A body that is not clean UTF-8 would be silently corrupted by a rewrite
+  // it never asked for — toString swaps invalid bytes for U+FFFD. Only rewrite
+  // a body that decodes and re-encodes back to the very same bytes; anything
+  // else passes through untouched, whatever its rules matched.
+  const text = plain.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(plain)) return passthrough;
+
+  const { text: replaced, count } = applyReplacements(text, rules);
   if (count === 0) return passthrough;
-  const replaced = Buffer.from(text, "utf8");
+  const rewritten = Buffer.from(replaced, "utf8");
 
   if (kind === "" || kind === "identity") {
-    return { body: replaced, encoding, count };
+    return { body: rewritten, encoding, count };
   }
-  const encoded = encodeBody(replaced, kind);
+  const encoded = encodeBody(rewritten, kind);
   if (encoded === null) return passthrough; // cannot re-compress: leave untouched
   return { body: encoded, encoding, count };
 }

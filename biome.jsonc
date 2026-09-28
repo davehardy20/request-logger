@@ -18,6 +18,16 @@
   },
   "overrides": [
     {
+      // Actively maintained here, so the linter and assist apply — but the
+      // formatter stays off: these two still carry hand-formatted course code
+      // whose untouched regions would churn under a formatter pass.
+      "includes": ["proxy.ts", "proxy.test.ts"],
+      "formatter": { "enabled": false }
+    },
+    {
+      // Untouched copies from the course repo: excluded entirely so a future
+      // edit does not drag a whole-file reformat along. When one of these is
+      // rewritten from scratch, remove its entry and format it.
       "includes": [
         "agents.ts",
         "agents.test.ts",
@@ -26,8 +36,6 @@
         "config-wizard.test.ts",
         "model-discovery.ts",
         "model-discovery.test.ts",
-        "proxy.ts",
-        "proxy.test.ts",
         "render.ts",
         "render.test.ts"
       ],

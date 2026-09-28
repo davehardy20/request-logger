@@ -224,6 +224,16 @@ describe("rewriteBody", () => {
     expect(count).toBe(0);
   });
 
+  it("never rewrites a textual body that is not clean UTF-8, even on a match", () => {
+    // 0xE9 is é in latin-1 — invalid as UTF-8. A rewrite would have to
+    // re-encode the whole body, swapping that byte for U+FFFD, so the rule
+    // must not apply at all.
+    const body = Buffer.from([0x22, 0x64, 0x65, 0x6e, 0x79, 0x22, 0xe9]);
+    const { body: out, count } = rewriteBody(body, undefined, rules);
+    expect(out).toBe(body);
+    expect(count).toBe(0);
+  });
+
   it("treats identity encoding as plain text", () => {
     const { body: out, count } = rewriteBody(Buffer.from("deny"), "identity", rules);
     expect(out.toString("utf8")).toBe("allow");

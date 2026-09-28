@@ -1,18 +1,17 @@
 import http from "node:http";
 import net from "node:net";
-import { describe, it, expect, afterEach } from "vitest";
-import { resolveChoice } from "./agents";
-import type { CustomTarget } from "./agents";
+import { afterEach, describe, expect, it } from "vitest";
+import { type CustomTarget, resolveChoice } from "./agents";
 import {
   BURST_THRESHOLD,
   BURST_WINDOW_MS,
+  type BurstState,
   burstKey,
   handle,
   rejectUpgrade,
   trackBurst,
   upstreamConnection,
   upstreamPathPrefix,
-  type BurstState,
 } from "./proxy";
 import type { ReplacementRule } from "./replacements";
 
@@ -214,8 +213,10 @@ describe("rejectUpgrade", () => {
     });
     server.on("upgrade", rejectUpgrade);
 
-    await new Promise<void>((resolve) => server!.listen(0, resolve));
-    const { port } = server.address() as net.AddressInfo;
+    const running = server;
+    if (!running) throw new Error("test server was not created");
+    await new Promise<void>((resolve) => running.listen(0, resolve));
+    const { port } = running.address() as net.AddressInfo;
 
     const response = await new Promise<string>((resolve, reject) => {
       const socket = net.connect(port, "127.0.0.1", () => {
@@ -264,13 +265,13 @@ describe("trackBurst", () => {
 
   it("suppresses once the same method+path+status repeats past the threshold inside the window", () => {
     let state: BurstState | null = null;
-    let lastResult;
+    let lastResult: ReturnType<typeof trackBurst> | undefined;
     const now = 0;
     for (let i = 0; i < BURST_THRESHOLD; i++) {
       lastResult = trackBurst(state, KEY, now); // all in the same instant
       state = lastResult.state;
     }
-    expect(lastResult!.suppressed).toBe(false); // exactly at the threshold: not yet over it
+    expect(lastResult?.suppressed).toBe(false); // exactly at the threshold: not yet over it
 
     const over = trackBurst(state, KEY, now);
     expect(over.suppressed).toBe(true);
@@ -389,7 +390,10 @@ async function proxyAround(
 }
 
 afterEach(async () => {
-  while (running.length > 0) await running.pop()!.close();
+  while (running.length > 0) {
+    const entry = running.pop();
+    if (entry) await entry.close();
+  }
 });
 
 describe("handle with match-and-replace rules", () => {

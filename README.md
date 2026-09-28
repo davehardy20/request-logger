@@ -143,7 +143,8 @@ Things worth knowing:
 - Compressed bodies (gzip, brotli, deflate, zstd) are decompressed, rewritten,
   and re-compressed with the same algorithm, so the declared encoding stays
   true. An encoding that cannot be decoded is passed through untouched rather
-  than corrupted.
+  than corrupted, and so is a textual body that is not valid UTF-8 (some other
+  charset) — a rewrite must never corrupt bytes the rules never matched.
 - While response rules are in effect, responses are buffered instead of
   streamed: a match can straddle chunk boundaries, so the whole body must be in
   hand before any of it is safe to send. With no response rules, responses

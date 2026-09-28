@@ -16,28 +16,28 @@
  * Zero runtime dependencies — Node built-ins only.
  */
 
+import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import fs from "node:fs";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { styleText } from "node:util";
-import { renderMarkdown } from "./render";
 import {
-  resolveChoice,
-  shouldLogRequest,
   type AgentChoice,
   type CustomTarget,
   type ResolvedTarget,
+  resolveChoice,
+  shouldLogRequest,
 } from "./agents";
 import { askChoice, clearChoice, loadChoice, saveChoice } from "./config";
+import { renderMarkdown } from "./render";
 import {
   contentTypeIsTextish,
   loadReplacements,
+  type ReplacementRule,
   rewriteBody,
   rulesForScope,
-  type ReplacementRule,
 } from "./replacements";
 
 /**
@@ -139,8 +139,8 @@ function forwardHeaders(
   body: Buffer
 ): http.OutgoingHttpHeaders {
   const out: http.OutgoingHttpHeaders = { ...headers };
-  delete out["host"];
-  delete out["connection"];
+  delete out.host;
+  delete out.connection;
   delete out["accept-encoding"]; // force identity so we can read the stream
   delete out["transfer-encoding"];
   delete out["content-length"];
@@ -393,16 +393,29 @@ export function trackBurst(
   key: string,
   now: number
 ): BurstResult {
-  const fresh =
-    !state || state.key !== key || now - state.windowStart > BURST_WINDOW_MS;
-  const count = fresh ? 1 : state!.count + 1;
-  const windowStart = fresh ? now : state!.windowStart;
-  const wasWarned = fresh ? false : state!.warned;
-  const suppressed = count > BURST_THRESHOLD;
+  // Carried: the same signature still inside its window, so the count keeps
+  // climbing. Anything else — first sighting, a new signature, or a gap
+  // wider than the window — starts a fresh window at one.
+  const carried =
+    state !== null && state.key === key && now - state.windowStart <= BURST_WINDOW_MS;
+  if (carried && state !== null) {
+    const count = state.count + 1;
+    const suppressed = count > BURST_THRESHOLD;
+    return {
+      state: {
+        key,
+        windowStart: state.windowStart,
+        count,
+        warned: state.warned || suppressed,
+      },
+      suppressed,
+      justDetected: suppressed && !state.warned,
+    };
+  }
   return {
-    state: { key, windowStart, count, warned: wasWarned || suppressed },
-    suppressed,
-    justDetected: suppressed && !wasWarned,
+    state: { key, windowStart: now, count: 1, warned: false },
+    suppressed: false,
+    justDetected: false,
   };
 }
 
@@ -458,8 +471,10 @@ function writeCapture(c: Capture): void {
 
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    // The raw file keeps the bytes exactly as they arrived, so the request can
-    // still be replayed. Only the .md is decoded.
+    // The .request/.response files keep the bytes that were actually
+    // forwarded upstream and returned to the agent — rewritten, if
+    // match-and-replace rules matched — so a capture replays what really
+    // went over the wire. Only the .md is decoded.
     fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), c.requestBody);
     fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), c.responseRaw);
     fs.writeFileSync(
