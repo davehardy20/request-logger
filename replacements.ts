@@ -158,7 +158,9 @@ export function applyReplacements(
     if (hits === 0) continue;
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
-    if (out.length > limits.output) return { text, count: 0 };
+    if (out.length > limits.output || Buffer.byteLength(out, "utf8") > limits.output) {
+      return { text, count: 0 };
+    }
   }
   return { text: out, count };
 }
@@ -301,7 +303,8 @@ export function contentTypeIsTextish(contentType: string | string[] | undefined)
     type === "application/xml" ||
     type === "application/xhtml+xml" ||
     type === "application/x-www-form-urlencoded" ||
-    type.endsWith("+json")
+    type.endsWith("+json") ||
+    type.endsWith("+xml")
   );
 }
 
@@ -416,8 +419,11 @@ export function makeStreamRewriter(
           return Buffer.alloc(0);
         }
       }
-      // Never split a multi-byte UTF-8 character: step back over continuation bytes.
-      while (cut > 0 && (combined[cut] & 0xc0) === 0x80) cut--;
+      // Never split a multi-byte UTF-8 character, but never withhold more
+      // than the carry cap either: stepping back stops at the floor, and a
+      // mid-character boundary switches rewriteReady to verbatim below.
+      const min = Math.max(floor, 0);
+      while (cut > min && (combined[cut] & 0xc0) === 0x80) cut--;
       if (cut <= 0) {
         carry = combined;
         return Buffer.alloc(0);
@@ -438,4 +444,25 @@ export function makeStreamRewriter(
     },
     count: () => count
   };
+}
+
+/**
+ * Copies at most `budget` UTF-8 bytes of `text` without splitting a
+ * multi-byte character. A text longer than the budget never materializes
+ * whole: only its ≤ budget-character head is encoded (a transient of at
+ * most 3x the budget), then the cut is trimmed back to the byte budget.
+ * The budget is bytes, not characters — counting characters would let a
+ * multibyte-heavy text pass at up to 3x the limit.
+ */
+export function headWithinByteBudget(text: string, budget: number): Buffer {
+  if (text.length <= budget) {
+    const bytes = Buffer.from(text, "utf8");
+    let cut = Math.min(budget, bytes.length);
+    while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
+    return bytes.subarray(0, cut);
+  }
+  const head = Buffer.from(text.slice(0, budget), "utf8");
+  let cut = Math.min(budget, head.length);
+  while (cut > 0 && (head[cut] & 0xc0) === 0x80) cut--;
+  return head.subarray(0, cut);
 }

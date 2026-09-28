@@ -37,6 +37,7 @@ import {
   contentTypeIsSse,
   contentTypeIsTextish,
   DEFAULT_LIMITS,
+  headWithinByteBudget,
   loadReplacements,
   makeStreamRewriter,
   type ReplacementRule,
@@ -328,6 +329,13 @@ export function handle(
           delete headers.etag;
           delete headers.digest;
           delete headers["content-md5"];
+          // pipe() does not forward upstream socket errors to the piped
+          // stream, so a dead socket mid-decompression must be caught here
+          // or the client would hang until its own timeout.
+          upstreamRes.on("error", (err: Error) => {
+            console.error(`[request-logger] SSE upstream error: ${err.message}`);
+            finish();
+          });
         }
         res.writeHead(statusCode, headers);
         // A stream can outlive any buffer: the capture keeps at most
@@ -349,7 +357,12 @@ export function handle(
             captureDropped = true;
           }
         };
+        let finished = false;
         const finish = (): void => {
+          // Guarded: an upstream socket error can arrive after the decoded
+          // stream already ended, and a second flush would double-write.
+          if (finished) return;
+          finished = true;
           const tail = rewriter.flush();
           if (tail.length > 0) push(tail);
           res.end();
@@ -425,7 +438,7 @@ export function handle(
             "[request-logger] response body passed the rewrite size cap; it is forwarded untouched instead of rewritten."
           );
           res.writeHead(statusCode, upstreamRes.headers);
-          for (const buffered of responseChunks) res.write(buffered);
+          for (const held of responseChunks) res.write(held);
           res.write(chunk);
           return;
         }
@@ -652,7 +665,8 @@ let burstState: BurstState | null = null;
  */
 function responseForCapture(c: Capture): Buffer {
   // Count encoded bytes, not string characters: a multibyte-heavy response
-  // can be three bytes per character, and the budget is bytes.
+  // can be three bytes per character, and the budget is bytes. The cut
+  // itself lives in replacements.ts (headWithinByteBudget), tested there.
   const oversized =
     c.responseCaptureDropped === true ||
     Buffer.byteLength(c.responseRaw, "utf8") > CAPTURE_LIMIT_BYTES;
@@ -662,13 +676,7 @@ function responseForCapture(c: Capture): Buffer {
       "[request-logger] response passed the capture size cap; the capture keeps the first part only."
     )
   );
-  // Cut to the budget on a character boundary: take at most CAP characters
-  // (a transient of at most 3x budget), then trim to the byte budget without
-  // splitting a multi-byte character.
-  const head = Buffer.from(c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES), "utf8");
-  let cut = Math.min(CAPTURE_LIMIT_BYTES, head.length);
-  while (cut > 0 && (head[cut] & 0xc0) === 0x80) cut--;
-  return head.subarray(0, cut);
+  return headWithinByteBudget(c.responseRaw, CAPTURE_LIMIT_BYTES);
 }
 
 function writeCapture(c: Capture): void {

@@ -171,9 +171,9 @@ Things worth knowing:
   stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
   `Content-MD5` are dropped. The same validators are dropped when a
   compressed SSE stream is decoded and forwarded as identity — the delivered
-  bytes are no longer the described ones even if no rule matched. Nothing
-  matched, and the response is forwarded exactly as it arrived — headers and
-  all. Bodyless responses (HEAD, 204, 304) are never touched, keeping their
+  bytes are no longer the described ones even if no rule matched. When
+  nothing matches, the response is forwarded exactly as it arrived — headers
+  and all. Bodyless responses (HEAD, 204, 304) are never touched, keeping their
   `Content-Length`.
 - A malformed rules file never takes traffic down: invalid JSON or invalid
   rules are reported once and skipped, and everything else passes through.

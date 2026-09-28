@@ -7,6 +7,7 @@ import {
   applyReplacements,
   contentTypeIsSse,
   contentTypeIsTextish,
+  headWithinByteBudget,
   loadReplacements,
   makeStreamRewriter,
   type ReplacementRule,
@@ -250,6 +251,9 @@ describe("contentTypeIsTextish", () => {
     expect(contentTypeIsTextish("text/event-stream")).toBe(true);
     expect(contentTypeIsTextish("text/plain")).toBe(true);
     expect(contentTypeIsTextish("application/vnd.api+json")).toBe(true);
+    expect(contentTypeIsTextish("application/xml")).toBe(true);
+    expect(contentTypeIsTextish("application/atom+xml")).toBe(true);
+    expect(contentTypeIsTextish("application/rss+xml; charset=utf-8")).toBe(true);
   });
 
   it("accepts a missing content type, so unstated does not mean untouched", () => {
@@ -274,6 +278,15 @@ describe("caps (RewriteLimits)", () => {
     );
     expect(result.count).toBe(0);
     expect(result.text).toBe("aaaaaaaaaaaaaaaa");
+  });
+
+  it("counts the output cap in encoded bytes, not string characters", () => {
+    // 10 characters, 20 encoded UTF-8 bytes: a character-counted cap would
+    // let it through; a byte-counted cap bails and returns the original.
+    const tiny = { decoded: 1024, input: 1024, output: 10, carry: 1024 };
+    const result = applyReplacements("aaaaaaaaaa", [{ match: "a", replace: "\u00e9" }], tiny);
+    expect(result.count).toBe(0);
+    expect(result.text).toBe("aaaaaaaaaa");
   });
 
   it("passes a body larger than the input cap through untouched", () => {
@@ -455,5 +468,53 @@ describe("makeStreamRewriter carry cap (Greptile round 3)", () => {
       rewriter.flush()
     ];
     expect(Buffer.concat(out).toString("utf8")).toBe("keep this: allow please");
+  });
+});
+
+describe("headWithinByteBudget", () => {
+  it("returns the whole text when it fits the byte budget", () => {
+    expect(headWithinByteBudget("0123456789", 10).toString("utf8")).toBe("0123456789");
+    expect(headWithinByteBudget("a\u00e9b", 10).toString("utf8")).toBe("a\u00e9b");
+  });
+
+  it("cuts ASCII text at the budget exactly", () => {
+    expect(headWithinByteBudget("0123456789ABC", 10).toString("utf8")).toBe("0123456789");
+  });
+
+  it("never splits a multi-byte character at the budget", () => {
+    // \u00e9 is 2 bytes: a budget of 3 keeps "a\u00e9" exactly; a budget of
+    // 2 would split the \u00e9, so it lands on the character boundary.
+    expect(headWithinByteBudget("a\u00e9", 3).toString("utf8")).toBe("a\u00e9");
+    expect(headWithinByteBudget("a\u00e9", 2).toString("utf8")).toBe("a");
+  });
+
+  it("counts the budget in bytes, not characters, for multibyte-heavy text", () => {
+    // 8 \u00e9 characters = 16 bytes; budget 11 cuts mid-character and must
+    // step back to 10 bytes (5 characters), not return 11 characters.
+    const out = headWithinByteBudget("\u00e9".repeat(8), 11);
+    expect(out.length).toBe(10);
+    expect(out.toString("utf8")).toBe("\u00e9".repeat(5));
+  });
+
+  it("returns an empty buffer for a zero budget", () => {
+    expect(headWithinByteBudget("anything", 0).length).toBe(0);
+  });
+});
+
+describe("stream rewriter invalid UTF-8", () => {
+  it("delivers a stream of invalid UTF-8 bytes instead of withholding it whole", () => {
+    // Before the clamp: the UTF-8 step-back walked past the carry floor on
+    // continuation bytes, withholding the entire stream (here: 64 bytes,
+    // deliverable: zero). With the clamp, the ready region stops at the
+    // floor, ends mid-character, and the rewriter switches to verbatim.
+    const tiny = { decoded: 1024, input: 1024, output: 2048, carry: 8 };
+    const rewriter = makeStreamRewriter([{ match: "deny", replace: "allow" }], tiny);
+    const first = rewriter.push(Buffer.alloc(64, 0x80));
+    expect(first.length).toBe(56); // 64 minus the 8-byte carry window
+    // Verbatim from here: the withheld tail plus the chunk, unrewritten.
+    const second = rewriter.push(Buffer.from("deny"));
+    expect(Buffer.concat([first, second])).toEqual(
+      Buffer.concat([Buffer.alloc(64, 0x80), Buffer.from("deny")])
+    );
   });
 });
