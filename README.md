@@ -449,3 +449,14 @@ line in `agents.ts`.
 - **Nothing to do for a student on an unlisted provider.** "Custom base URL" at
   the provider question already covers that — see the top of this README. It
   is not a per-agent thing to add; every supported agent gets it for free.
+
+## Credits
+
+This tool is a fork of the `request-logger` that [Matt Pocock](https://github.com/mattpocock)
+built for his [AI Coding Crash Course](https://github.com/ai-hero-dev/ai-coding-crash-course)
+(see the [course page](https://www.aihero.dev/workshops/ai-coding-crash-course)). If you
+want to learn how to inspect what your coding agent actually sends to the
+model, that course is where this tool came from, and it is excellent.
+
+The match-and-replace rules (`replacements.json`), and a handful of small
+fixes, are additions in this fork.
