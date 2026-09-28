@@ -51,8 +51,22 @@ type ProxyTarget = ResolvedTarget | CustomTarget;
 const PORT = Number(process.env.PORT ?? 8787);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const LOG_DIR = path.join(HERE, "logs");
+const DEFAULT_LOG_DIR = path.join(HERE, "logs");
 const STATE_FILE = path.join(HERE, ".agent-choice.json");
+// Module-level on purpose, like burstState below: one directory for the
+// whole process. Tests swap it for a scratch directory via setLogDir so
+// end-to-end runs never write synthetic captures into the real logs/.
+let LOG_DIR = DEFAULT_LOG_DIR;
+
+/** Test hook: point the capture writer at a scratch directory. */
+export function setLogDir(dir: string): void {
+  LOG_DIR = dir;
+}
+
+/** Test hook: put captures back where a real run keeps them. */
+export function resetLogDir(): void {
+  LOG_DIR = DEFAULT_LOG_DIR;
+}
 // Match-and-replace rules, read from disk on every request so edits apply
 // without a restart. Missing or empty file = zero rules = byte-for-byte
 // pass-through, exactly as this tool behaved before the feature existed.

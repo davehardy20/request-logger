@@ -1,6 +1,9 @@
+import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CustomTarget, resolveChoice } from "./agents";
 import {
   BURST_THRESHOLD,
@@ -9,6 +12,8 @@ import {
   burstKey,
   handle,
   rejectUpgrade,
+  resetLogDir,
+  setLogDir,
   trackBurst,
   upstreamConnection,
   upstreamPathPrefix,
@@ -389,7 +394,18 @@ async function proxyAround(
   return `http://127.0.0.1:${port}`;
 }
 
+let logDir: string;
+
+beforeEach(() => {
+  // End-to-end handle() runs write real captures; keep them in a scratch
+  // directory so the developer's logs/ folder never fills with synthetic data.
+  logDir = fs.mkdtempSync(path.join(os.tmpdir(), "request-logger-logs-"));
+  setLogDir(logDir);
+});
+
 afterEach(async () => {
+  resetLogDir();
+  await fs.promises.rm(logDir, { recursive: true, force: true });
   while (running.length > 0) {
     const entry = running.pop();
     if (entry) await entry.close();
@@ -420,6 +436,11 @@ describe("handle with match-and-replace rules", () => {
     expect(response.headers.get("content-length")).toBe(
       String(Buffer.byteLength('{"text":"pass it"}'))
     );
+    // The capture of the rewritten exchange lands in the scratch directory,
+    // never in the developer's real logs/ folder.
+    const captured = fs.readdirSync(logDir);
+    expect(captured.some((f) => f.endsWith(".md"))).toBe(true);
+    expect(captured.some((f) => f.endsWith(".request.txt"))).toBe(true);
   });
 
   it("passes both directions through byte-for-byte with no rules", async () => {
