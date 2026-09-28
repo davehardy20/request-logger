@@ -99,6 +99,88 @@ Everything else about a custom answer still behaves the same way: change it
 any time with `--force`, and it is never kept for an agent that cannot be
 logged.
 
+## Match and replace
+
+The proxy can rewrite the traffic it intercepts before forwarding it, using
+simple literal substring rules. Rules live in `request-logger/replacements.json`
+as a JSON array:
+
+```json
+[
+  { "match": "deny", "replace": "allow" },
+  { "match": "block", "replace": "pass" }
+]
+```
+
+Every rule is a plain, case-sensitive string substitution — `deny` becomes
+`allow`, everywhere it appears. Rules apply to both the request body (what the
+agent sends) and the response body (what the provider answers), and they apply
+in order, top to bottom: each rule sees the output of the one above it, like a
+pipeline of find-and-replace. Order matters — with `deny`→`allow` above
+`allow`→`pass`, a `deny` ends up as `pass`.
+
+If the file is missing, empty, or holds `[]`, nothing is rewritten: every
+request and response passes through byte-for-byte, exactly as the tool behaved
+before this feature existed. That is the default, and the file that ships with
+the tool contains `[]`.
+
+A rule can be limited to one direction with a scope:
+
+```json
+{ "match": "I cannot assist", "replace": "", "scope": "response" }
+```
+
+Valid scopes are `"request"` and `"response"`. Without one, the rule applies to
+both. The rule above deletes the phrase from provider responses only, leaving
+what the agent sends untouched.
+
+Things worth knowing:
+
+- The rules file is re-read on every request, so edits apply to the next
+  request without restarting the tool.
+- Only textual bodies are rewritten (JSON, text, XML, SSE). Binary traffic
+  is never touched — decided by the media type alone, so a parameter like
+  `application/octet-stream; filename=config.json` stays binary.
+- Compressed bodies (gzip, brotli, deflate, zstd) are decompressed, rewritten,
+  and re-compressed with the same algorithm, so the declared encoding stays
+  true. An encoding that cannot be decoded is passed through untouched rather
+  than corrupted, and so is a textual body that is not valid UTF-8 (some other
+  charset) — a rewrite must never corrupt bytes the rules never matched.
+- Ordinary responses are buffered while response rules are in effect: a match
+  can straddle chunk boundaries, so the whole body must be in hand before any
+  of it is safe to send. Server-Sent Events streams are never buffered — a
+  stream that never ends can never be buffered whole — so each SSE chunk is
+  rewritten as it arrives and sent on immediately, with the last few bytes
+  held back until the next chunk shows what follows. With no response rules,
+  everything streams back unbuffered as before.
+- Rewriting is bounded. A compressed body that would decompress past 64 MiB is
+  passed through still compressed; a body larger than 64 MiB is never
+  rewritten (an oversized buffered response switches mid-flight to untouched
+  forwarding, headers and all); a rule set whose combined output would grow
+  past 256 MiB (longer replacements than matches) is abandoned whole — the
+  original text comes back; and the SSE rewriter never withholds more than
+  1 MiB waiting for a match to complete, so a pathological stream keeps
+  flowing even if a match spanning further than that goes unrewritten. The
+  on-disk capture of a response keeps at most the first 8 MiB — a
+  per-stream budget, so several concurrent streams stay bounded — and says
+  so on the console when it truncates; every byte still reaches the agent.
+  Request captures are never capped: the request is already in memory to be
+  forwarded, and a complete, replayable `.request.txt` is one of this tool's
+  promises. One pathological body cannot eat the process.
+- When a rewrite changes the bytes, headers that described the original bytes
+  stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
+  `Content-MD5` are dropped. The same validators are dropped when a
+  compressed SSE stream is decoded and forwarded as identity — the delivered
+  bytes are no longer the described ones even if no rule matched. Nothing
+  matched, and the response is forwarded exactly as it arrived — headers and
+  all. Bodyless responses (HEAD, 204, 304) are never touched, keeping their
+  `Content-Length`.
+- A malformed rules file never takes traffic down: invalid JSON or invalid
+  rules are reported once and skipped, and everything else passes through.
+- The log files show the traffic as rewritten — what actually went up and came
+  back down — and the console line notes how many matches were replaced:
+  `rewrote: request 2 match(es), response 1 match(es)`.
+
 ## The agents
 
 The tool prints the correct command for you, so you do not have to copy anything
@@ -260,8 +342,11 @@ were sent, so you can still replay it.
   because several agents share the same URLs and guessing gets them wrong.
 - Your real auth header passes through untouched, so your requests authenticate
   normally. The tool only reads a copy on the way past.
-- Responses are **streamed straight back** as they arrive, so your agent behaves
-  exactly as it would without the tool.
+- Responses are **streamed straight back** as they arrive, so your agent
+  behaves exactly as it would without the tool. The one exception is match
+  and replace (see above): while response rules are in effect, responses are
+  buffered so the whole body can be rewritten before any of it is sent —
+  except SSE streams, which keep streaming and are rewritten chunk by chunk.
 
 ### One message is not one request
 
@@ -296,11 +381,12 @@ genuine POST the tool would otherwise write a full capture for. Left
 unchecked, that is thousands of near-identical files in a few seconds.
 
 Once the same method, path and status code repeats more than 20 times inside
-2 seconds, this tool stops writing a capture for every repeat. It still
-forwards every one of them untouched, so your agent is not affected; it just
-stops filling your disk and your terminal with duplicates. You get one loud
-warning naming the call and the likely causes, then a single summary line
-every 500 repeats for as long as the loop continues.
+2 seconds, this tool stops writing a capture for every repeat. Every repeat
+is still forwarded — and still rewritten, if match-and-replace rules are in
+effect — so your agent is not affected; the tool just stops filling your disk
+and your terminal with duplicates. You get one loud warning naming the call
+and the likely causes, then a single summary line every 500 repeats for as
+long as the loop continues.
 
 The fix is always upstream of this tool: stop the agent, fix the base URL,
 model ID or credentials, and start again. `omp` hitting `http://` instead of
@@ -391,3 +477,14 @@ line in `agents.ts`.
 - **Nothing to do for a student on an unlisted provider.** "Custom base URL" at
   the provider question already covers that — see the top of this README. It
   is not a per-agent thing to add; every supported agent gets it for free.
+
+## Credits
+
+This tool is a fork of the `request-logger` that [Matt Pocock](https://github.com/mattpocock)
+built for his [AI Coding Crash Course](https://github.com/ai-hero-dev/ai-coding-crash-course)
+(see the [course page](https://www.aihero.dev/workshops/ai-coding-crash-course)). If you
+want to learn how to inspect what your coding agent actually sends to the
+model, that course is where this tool came from, and it is excellent.
+
+The match-and-replace rules (`replacements.json`), and a handful of small
+fixes, are additions in this fork.

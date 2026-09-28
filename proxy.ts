@@ -16,22 +16,33 @@
  * Zero runtime dependencies — Node built-ins only.
  */
 
+import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import fs from "node:fs";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { styleText } from "node:util";
-import { renderMarkdown } from "./render";
+import zlib from "node:zlib";
 import {
-  resolveChoice,
-  shouldLogRequest,
   type AgentChoice,
   type CustomTarget,
   type ResolvedTarget,
+  resolveChoice,
+  shouldLogRequest,
 } from "./agents";
 import { askChoice, clearChoice, loadChoice, saveChoice } from "./config";
+import { renderMarkdown } from "./render";
+import {
+  contentTypeIsSse,
+  contentTypeIsTextish,
+  DEFAULT_LIMITS,
+  loadReplacements,
+  makeStreamRewriter,
+  type ReplacementRule,
+  rewriteBody,
+  rulesForScope,
+} from "./replacements";
 
 /**
  * A resolved target the proxy can actually route to and render: a catalogue
@@ -44,8 +55,41 @@ type ProxyTarget = ResolvedTarget | CustomTarget;
 const PORT = Number(process.env.PORT ?? 8787);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const LOG_DIR = path.join(HERE, "logs");
+const DEFAULT_LOG_DIR = path.join(HERE, "logs");
 const STATE_FILE = path.join(HERE, ".agent-choice.json");
+// Module-level on purpose, like burstState below: one directory for the
+// whole process. Tests swap it for a scratch directory via setLogDir so
+// end-to-end runs never write synthetic captures into the real logs/.
+let LOG_DIR = DEFAULT_LOG_DIR;
+
+/** Test hook: point the capture writer at a scratch directory. */
+export function setLogDir(dir: string): void {
+  LOG_DIR = dir;
+}
+
+/** Test hook: put captures back where a real run keeps them. */
+export function resetLogDir(): void {
+  LOG_DIR = DEFAULT_LOG_DIR;
+}
+// Match-and-replace rules, read from disk on every request so edits apply
+// without a restart. Missing or empty file = zero rules = byte-for-byte
+// pass-through, exactly as this tool behaved before the feature existed.
+const REPLACEMENTS_FILE = path.join(HERE, "replacements.json");
+
+/**
+ * Size caps for response handling. Rewriting stops past the decoded cap.
+ * The capture keeps at most CAPTURE_LIMIT_BYTES per response — a per-stream
+ * memory budget, so several concurrent streams stay bounded (8 MiB each,
+ * not the full rewrite budget); a console note says when it truncates, and
+ * the agent still receives every byte.
+ */
+const PROXY_LIMITS = { decoded: DEFAULT_LIMITS.decoded };
+const CAPTURE_LIMIT_BYTES = 8 * 1024 * 1024;
+
+/** A header value, when Node reports it as one value or many. */
+function header(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
 
 // ---------------------------------------------------------------------------
 // Proxying
@@ -123,8 +167,8 @@ function forwardHeaders(
   body: Buffer
 ): http.OutgoingHttpHeaders {
   const out: http.OutgoingHttpHeaders = { ...headers };
-  delete out["host"];
-  delete out["connection"];
+  delete out.host;
+  delete out.connection;
   delete out["accept-encoding"]; // force identity so we can read the stream
   delete out["transfer-encoding"];
   delete out["content-length"];
@@ -132,10 +176,21 @@ function forwardHeaders(
   return out;
 }
 
-function handle(
+/**
+ * One request: buffer the agent's body, rewrite it if request rules apply,
+ * forward it upstream, then either stream the response straight back (no
+ * response rules — the agent is unaffected) or buffer and rewrite the
+ * response before returning it (response rules exist).
+ *
+ * The rules are read from disk on every call, so edits to replacements.json
+ * take effect on the next request without a restart. Tests pass rules
+ * directly instead.
+ */
+export function handle(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  target: ProxyTarget
+  target: ProxyTarget,
+  rules: ReplacementRule[] = loadReplacements(REPLACEMENTS_FILE)
 ): void {
   const reqPath = req.url ?? "/";
   // The path actually sent upstream: the agent's own request path, prefixed
@@ -151,19 +206,273 @@ function handle(
     const body = Buffer.concat(bodyChunks);
     const timestamp = new Date().toISOString();
     const base = baseName(target);
-    const encoding = req.headers["content-encoding"];
+    const requestEncoding = header(req.headers["content-encoding"]);
     const { hostname, port, useHttps } = upstreamConnection(target);
 
+    // Match-and-replace on the way out. The capture below logs the bytes
+    // that were actually forwarded, so the .md shows the model what it
+    // really received.
+    const requestRules = rulesForScope(rules, "request");
+    const responseRules = rulesForScope(rules, "response");
+    let forwardBody: Buffer = body;
+    let requestReplacements = 0;
+    if (
+      requestRules.length > 0 &&
+      contentTypeIsTextish(req.headers["content-type"])
+    ) {
+      const rewritten = rewriteBody(body, requestEncoding, requestRules);
+      forwardBody = rewritten.body;
+      requestReplacements = rewritten.count;
+    }
+
     const onUpstreamResponse = (upstreamRes: http.IncomingMessage) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+      const statusCode = upstreamRes.statusCode ?? 502;
+      const contentType = upstreamRes.headers["content-type"];
+      // A bodyless response (HEAD, 204, 304) carries nothing to rewrite, and
+      // its content-length describes a body that will never arrive — forward
+      // it verbatim rather than rewriting its headers around an empty body.
+      const bodyless =
+        req.method === "HEAD" || statusCode === 204 || statusCode === 304;
+      // An SSE stream whose content-encoding has no streaming decoder here
+      // cannot be safely rewritten — treating compressed bytes as text is
+      // guessing. Stream it through verbatim with a warning instead.
+      const encKind = (header(upstreamRes.headers["content-encoding"]) ?? "")
+        .trim()
+        .toLowerCase();
+      const streamingDecoder: (() => zlib.Gunzip) | (() => zlib.Inflate) | (() => zlib.BrotliDecompress) | undefined =
+        encKind === "gzip"
+          ? zlib.createGunzip
+          : encKind === "deflate"
+            ? zlib.createInflate
+            : encKind === "br"
+              ? zlib.createBrotliDecompress
+              : undefined;
+      const sseEncodingUnreadable =
+        contentTypeIsSse(contentType) &&
+        encKind !== "" &&
+        encKind !== "identity" &&
+        !streamingDecoder;
+      if (sseEncodingUnreadable) {
+        console.warn(
+          `[request-logger] SSE response arrived ${encKind}-compressed; this tool has no streaming decoder for it, so the stream passes through untouched.`
+        );
+      }
+      const canRewrite =
+        responseRules.length > 0 &&
+        !bodyless &&
+        contentTypeIsTextish(contentType) &&
+        !sseEncodingUnreadable;
+
+      // No response rules, a binary body, or nothing to rewrite: stream
+      // straight back to the agent, unbuffered, exactly as this tool behaved
+      // before match-and-replace existed.
+      if (!canRewrite) {
+        res.writeHead(statusCode, upstreamRes.headers);
+        // The capture keeps at most CAPTURE_LIMIT_BYTES of a stream that may
+        // never end; the bytes themselves still all flow through.
+        const responseChunks: Buffer[] = [];
+        let captured = 0;
+        let captureDropped = false;
+        upstreamRes.on("data", (chunk: Buffer) => {
+          if (captured < CAPTURE_LIMIT_BYTES) {
+            responseChunks.push(chunk);
+            captured += chunk.length;
+          } else {
+            captureDropped = true;
+          }
+          res.write(chunk); // stream straight back to the agent, unbuffered
+        });
+        upstreamRes.on("end", () => {
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: Buffer.concat(responseChunks).toString("utf8"),
+            responseCaptureDropped: captureDropped,
+            requestReplacements,
+            responseReplacements: 0,
+          });
+        });
+        return;
+      }
+
+      // A Server-Sent Events stream may never end, so it can never be
+      // buffered whole: waiting for the end would hang the agent forever.
+      // Instead each chunk is rewritten as it arrives and sent on at once,
+      // with the last few bytes withheld until the next chunk shows what
+      // follows — see makeStreamRewriter.
+      if (contentTypeIsSse(contentType)) {
+        const rewriter = makeStreamRewriter(responseRules);
+        const headers = { ...upstreamRes.headers };
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
+        // An upstream that compresses despite the stripped accept-encoding
+        // (rare, but it happens) must not feed the rewriter compressed
+        // bytes: it would find no matches and pass the rules by silently.
+        // Decode the stream on the way through and send it on as identity.
+        // Validators that describe the compressed representation (ETag,
+        // Digest, Content-MD5) no longer describe what the agent receives,
+        // so they go the same way as on the buffered path.
+        let source: NodeJS.ReadableStream = upstreamRes;
+        if (encKind !== "" && encKind !== "identity" && streamingDecoder) {
+          const decoder = streamingDecoder();
+          source = upstreamRes.pipe(decoder);
+          delete headers["content-encoding"];
+          delete headers.etag;
+          delete headers.digest;
+          delete headers["content-md5"];
+        }
+        res.writeHead(statusCode, headers);
+        // A stream can outlive any buffer: the capture keeps at most
+        // CAPTURE_LIMIT_BYTES of it, and rewriting stops (with the withheld
+        // tail flushed, in order) once the decoded stream passes the
+        // decoded cap. Progress and bounded memory beat completeness on a
+        // stream that was never going to be reasonably rewritable anyway.
+        const written: Buffer[] = [];
+        let captured = 0;
+        let captureDropped = false;
+        let fed = 0;
+        let rewriteAbandoned = false;
+        const push = (out: Buffer): void => {
+          res.write(out);
+          if (captured < CAPTURE_LIMIT_BYTES) {
+            written.push(out);
+            captured += out.length;
+          } else {
+            captureDropped = true;
+          }
+        };
+        const finish = (): void => {
+          const tail = rewriter.flush();
+          if (tail.length > 0) push(tail);
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: Buffer.concat(written).toString("utf8"),
+            responseCaptureDropped: captureDropped,
+            requestReplacements,
+            responseReplacements: rewriter.count(),
+          });
+        };
+        source.on("data", (chunk: Buffer) => {
+          fed += chunk.length;
+          if (rewriteAbandoned) {
+            push(chunk);
+            return;
+          }
+          if (fed > PROXY_LIMITS.decoded) {
+            rewriteAbandoned = true;
+            console.warn(
+              "[request-logger] SSE stream passed the rewrite size cap; rewriting stops, the rest passes through untouched."
+            );
+            const tail = rewriter.flush();
+            if (tail.length > 0) push(tail);
+            push(chunk);
+            return;
+          }
+          const out = rewriter.push(chunk);
+          if (out.length > 0) push(out);
+        });
+        source.on("end", finish);
+        source.on("error", (err: Error) => {
+          // A truncated or corrupt compressed stream: flush what was
+          // withheld, close cleanly, and still write the capture.
+          console.error(`[request-logger] SSE stream error: ${err.message}`);
+          finish();
+        });
+        return;
+      }
+
+      // Everything else is a whole body: buffer it, because a match can
+      // straddle chunks, so none of the body is safe to send until all of
+      // it is read. The agent's streaming is traded for a correct rewrite,
+      // and only while response rules exist. A body that outgrows the
+      // rewrite cap mid-buffer stops being buffered: headers go out as they
+      // arrived, what was already read is written straight through, and the
+      // rest streams — a body too big to rewrite is still a body the agent
+      // must receive. Nothing matched: the response is forwarded exactly as
+      // it arrived, headers and all. Something matched: lengths and digests
+      // that described the original bytes (content-length, ETag, Digest,
+      // Content-MD5) would misdescribe the rewritten ones, so length is
+      // recomputed and the digests dropped; the declared content-encoding
+      // stays true because rewriteBody re-compresses with the same algorithm.
       const responseChunks: Buffer[] = [];
+      let buffered = 0;
+      let oversized = false;
       upstreamRes.on("data", (chunk: Buffer) => {
+        if (oversized) {
+          res.write(chunk);
+          return;
+        }
+        if (buffered + chunk.length > PROXY_LIMITS.decoded) {
+          oversized = true;
+          console.warn(
+            "[request-logger] response body passed the rewrite size cap; it is forwarded untouched instead of rewritten."
+          );
+          res.writeHead(statusCode, upstreamRes.headers);
+          for (const buffered of responseChunks) res.write(buffered);
+          res.write(chunk);
+          return;
+        }
         responseChunks.push(chunk);
-        res.write(chunk); // stream straight back to the agent, unbuffered
+        buffered += chunk.length;
       });
       upstreamRes.on("end", () => {
-        res.end();
-        const responseRaw = Buffer.concat(responseChunks).toString("utf8");
+        if (oversized) {
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: "(response exceeded the rewrite size cap; forwarded untouched, not captured)",
+            requestReplacements,
+            responseReplacements: 0,
+          });
+          return;
+        }
+        const raw = Buffer.concat(responseChunks);
+        const rewritten = rewriteBody(
+          raw,
+          header(upstreamRes.headers["content-encoding"]),
+          responseRules
+        );
+        if (rewritten.count === 0) {
+          res.writeHead(statusCode, upstreamRes.headers);
+          res.end(raw);
+        } else {
+          const headers = { ...upstreamRes.headers };
+          delete headers["content-length"];
+          delete headers["transfer-encoding"];
+          delete headers.etag;
+          delete headers.digest;
+          delete headers["content-md5"];
+          if (rewritten.body.length > 0) {
+            headers["content-length"] = String(rewritten.body.length);
+          }
+          res.writeHead(statusCode, headers);
+          res.end(rewritten.body);
+        }
         writeCapture({
           base,
           target,
@@ -172,9 +481,11 @@ function handle(
           path: reqPath,
           statusCode: upstreamRes.statusCode ?? 0,
           headers: req.headers,
-          requestBody: body,
-          requestEncoding: Array.isArray(encoding) ? encoding[0] : encoding,
-          responseRaw,
+          requestBody: forwardBody,
+          requestEncoding,
+          responseRaw: (rewritten.count === 0 ? raw : rewritten.body).toString("utf8"),
+          requestReplacements,
+          responseReplacements: rewritten.count,
         });
       });
     };
@@ -185,7 +496,7 @@ function handle(
       path: upstreamPath,
       method: req.method,
       headers: {
-        ...forwardHeaders(req.headers, body),
+        ...forwardHeaders(req.headers, forwardBody),
         host: hostname,
       },
     };
@@ -203,7 +514,7 @@ function handle(
       );
     });
 
-    if (body.length > 0) upstreamReq.write(body);
+    if (forwardBody.length > 0) upstreamReq.write(forwardBody);
     upstreamReq.end();
   });
 }
@@ -244,6 +555,11 @@ interface Capture {
   requestBody: Buffer;
   requestEncoding?: string;
   responseRaw: string;
+  /** True when a streaming path had to drop capture bytes (set by the path, so the boundary case notes too). */
+  responseCaptureDropped?: boolean;
+  /** How many match-and-replace substitutions were applied each way. */
+  requestReplacements: number;
+  responseReplacements: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,21 +613,57 @@ export function trackBurst(
   key: string,
   now: number
 ): BurstResult {
-  const fresh =
-    !state || state.key !== key || now - state.windowStart > BURST_WINDOW_MS;
-  const count = fresh ? 1 : state!.count + 1;
-  const windowStart = fresh ? now : state!.windowStart;
-  const wasWarned = fresh ? false : state!.warned;
-  const suppressed = count > BURST_THRESHOLD;
+  // Carried: the same signature still inside its window, so the count keeps
+  // climbing. Anything else — first sighting, a new signature, or a gap
+  // wider than the window — starts a fresh window at one.
+  const carried =
+    state !== null && state.key === key && now - state.windowStart <= BURST_WINDOW_MS;
+  if (carried && state !== null) {
+    const count = state.count + 1;
+    const suppressed = count > BURST_THRESHOLD;
+    return {
+      state: {
+        key,
+        windowStart: state.windowStart,
+        count,
+        warned: state.warned || suppressed,
+      },
+      suppressed,
+      justDetected: suppressed && !state.warned,
+    };
+  }
   return {
-    state: { key, windowStart, count, warned: wasWarned || suppressed },
-    suppressed,
-    justDetected: suppressed && !wasWarned,
+    state: { key, windowStart: now, count: 1, warned: false },
+    suppressed: false,
+    justDetected: false,
   };
 }
 
 /** Module-level on purpose: one guard for the whole process, the same as LOG_DIR. */
 let burstState: BurstState | null = null;
+
+/**
+ * The response side of a capture never exceeds the per-capture budget on
+ * disk. The string is cut to length BEFORE the Buffer copy, so a huge
+ * buffered response is never duplicated in memory just to write a small
+ * capture. The request side is never capped: it is already in memory to be
+ * forwarded, and a complete, replayable .request.txt is one of this tool's
+ * promises.
+ */
+function responseForCapture(c: Capture): Buffer {
+  const oversized = c.responseCaptureDropped === true || c.responseRaw.length > CAPTURE_LIMIT_BYTES;
+  const text = c.responseRaw.length > CAPTURE_LIMIT_BYTES
+    ? c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES)
+    : c.responseRaw;
+  if (oversized) {
+    console.log(
+      dim(
+        "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+      )
+    );
+  }
+  return Buffer.from(text, "utf8");
+}
 
 function writeCapture(c: Capture): void {
   const label = c.target.agentLabel;
@@ -324,6 +676,7 @@ function writeCapture(c: Capture): void {
     );
     return;
   }
+
 
   const burst = trackBurst(
     burstState,
@@ -362,10 +715,17 @@ function writeCapture(c: Capture): void {
 
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    // The raw file keeps the bytes exactly as they arrived, so the request can
-    // still be replayed. Only the .md is decoded.
+    // The .request/.response files keep the bytes that were actually
+    // forwarded upstream and returned to the agent — rewritten, if
+    // match-and-replace rules matched — so a capture replays what really
+    // went over the wire. Only the .md is decoded. Both are capped at the
+    // per-capture budget: a response between the budget and the rewrite cap
+    // must not write a capture several times larger than documented, and an
+    // expansionary rule set cannot inflate the file past it either. The
+    // .md renders from the same capped bytes.
+    const capturedResponse = responseForCapture(c);
     fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), c.requestBody);
-    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), c.responseRaw);
+    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), capturedResponse);
     fs.writeFileSync(
       path.join(LOG_DIR, `${c.base}.md`),
       renderMarkdown({
@@ -378,7 +738,7 @@ function writeCapture(c: Capture): void {
         headers: c.headers,
         requestBody: c.requestBody,
         requestEncoding: c.requestEncoding,
-        responseRaw: c.responseRaw,
+        responseRaw: capturedResponse.toString("utf8"),
       })
     );
     console.log(
@@ -386,6 +746,13 @@ function writeCapture(c: Capture): void {
         `logs/${c.base}.md`
       )}`
     );
+    if (c.requestReplacements > 0 || c.responseReplacements > 0) {
+      console.log(
+        dim(
+          `           rewrote: request ${c.requestReplacements} match(es), response ${c.responseReplacements} match(es)`
+        )
+      );
+    }
   } catch (err) {
     console.error(
       `[request-logger] failed to write logs: ${(err as Error).message}`
@@ -405,7 +772,7 @@ function field(label: string, value: string): void {
   console.log(`  ${dim(label.padEnd(10))} ${value}`);
 }
 
-function printBanner(target: ProxyTarget): void {
+function printBanner(target: ProxyTarget, replacementRules: ReplacementRule[]): void {
   const rule = dim("-".repeat(72));
   const forwards =
     target.kind === "target" ? `https://${target.upstreamHost}` : target.upstreamBaseUrl;
@@ -415,6 +782,12 @@ function printBanner(target: ProxyTarget): void {
   field("Listening", `http://localhost:${PORT}`);
   field("Forwards", forwards);
   field("Logs", dim(LOG_DIR));
+  field(
+    "Rewrites",
+    replacementRules.length > 0
+      ? `${replacementRules.length} rule(s) from replacements.json`
+      : dim("off — replacements.json empty, traffic passes through")
+  );
   console.log(rule);
 
   for (const file of target.setup) {
@@ -543,10 +916,13 @@ async function main(): Promise<void> {
   }
 
   const target = resolution;
+  // Read once here only to describe the setup in the banner; handle() re-reads
+  // the file on every request so edits apply without a restart.
+  const replacementRules = loadReplacements(REPLACEMENTS_FILE);
   const server = http.createServer((req, res) => handle(req, res, target));
   server.on("upgrade", rejectUpgrade);
   server.listen(PORT, () => {
-    printBanner(target);
+    printBanner(target, replacementRules);
   });
 }
 
