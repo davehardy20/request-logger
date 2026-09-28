@@ -99,6 +99,61 @@ Everything else about a custom answer still behaves the same way: change it
 any time with `--force`, and it is never kept for an agent that cannot be
 logged.
 
+## Match and replace
+
+The proxy can rewrite the traffic it intercepts before forwarding it, using
+simple literal substring rules. Rules live in `request-logger/replacements.json`
+as a JSON array:
+
+```json
+[
+  { "match": "deny", "replace": "allow" },
+  { "match": "block", "replace": "pass" }
+]
+```
+
+Every rule is a plain, case-sensitive string substitution — `deny` becomes
+`allow`, everywhere it appears. Rules apply to both the request body (what the
+agent sends) and the response body (what the provider answers), and they apply
+in order, top to bottom: each rule sees the output of the one above it, like a
+pipeline of find-and-replace. Order matters — with `deny`→`allow` above
+`allow`→`pass`, a `deny` ends up as `pass`.
+
+If the file is missing, empty, or holds `[]`, nothing is rewritten: every
+request and response passes through byte-for-byte, exactly as the tool behaved
+before this feature existed. That is the default, and the file that ships with
+the tool contains `[]`.
+
+A rule can be limited to one direction with a scope:
+
+```json
+{ "match": "I cannot assist", "replace": "", "scope": "response" }
+```
+
+Valid scopes are `"request"` and `"response"`. Without one, the rule applies to
+both. The rule above deletes the phrase from provider responses only, leaving
+what the agent sends untouched.
+
+Things worth knowing:
+
+- The rules file is re-read on every request, so edits apply to the next
+  request without restarting the tool.
+- Only textual bodies are rewritten (JSON, text, SSE, XML). Binary traffic —
+  images, audio — is never touched.
+- Compressed bodies (gzip, brotli, deflate, zstd) are decompressed, rewritten,
+  and re-compressed with the same algorithm, so the declared encoding stays
+  true. An encoding that cannot be decoded is passed through untouched rather
+  than corrupted.
+- While response rules are in effect, responses are buffered instead of
+  streamed: a match can straddle chunk boundaries, so the whole body must be in
+  hand before any of it is safe to send. With no response rules, responses
+  stream back unbuffered as before.
+- A malformed rules file never takes traffic down: invalid JSON or invalid
+  rules are reported once and skipped, and everything else passes through.
+- The log files show the traffic as rewritten — what actually went up and came
+  back down — and the console line notes how many matches were replaced:
+  `rewrote: request 2 match(es), response 1 match(es)`.
+
 ## The agents
 
 The tool prints the correct command for you, so you do not have to copy anything

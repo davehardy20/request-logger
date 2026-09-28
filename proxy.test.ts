@@ -2,16 +2,19 @@ import http from "node:http";
 import net from "node:net";
 import { describe, it, expect, afterEach } from "vitest";
 import { resolveChoice } from "./agents";
+import type { CustomTarget } from "./agents";
 import {
   BURST_THRESHOLD,
   BURST_WINDOW_MS,
   burstKey,
+  handle,
   rejectUpgrade,
   trackBurst,
   upstreamConnection,
   upstreamPathPrefix,
   type BurstState,
 } from "./proxy";
+import type { ReplacementRule } from "./replacements";
 
 const PORT = { port: 8787, platform: "linux" as NodeJS.Platform };
 
@@ -310,5 +313,167 @@ describe("trackBurst", () => {
     const afterGap = trackBurst(state, KEY, now + BURST_WINDOW_MS + 1);
     expect(afterGap.suppressed).toBe(false);
     expect(afterGap.state.count).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Match-and-replace, end to end through the real handle()
+// ---------------------------------------------------------------------------
+
+/** A hand-built custom target pointing at a local fake upstream. */
+function localTarget(port: number): CustomTarget {
+  return {
+    kind: "custom-target",
+    agent: "opencode",
+    agentLabel: "OpenCode",
+    providerLabel: "Custom base URL",
+    upstreamBaseUrl: `http://127.0.0.1:${port}`,
+    renderer: "openai",
+    baseUrl: "http://localhost:8787/v1",
+    command: "opencode",
+    setup: [],
+    notes: [],
+    warnings: [],
+  };
+}
+
+function listen(server: http.Server): Promise<number> {
+  return new Promise((resolve) =>
+    server.listen(0, "127.0.0.1", () =>
+      resolve((server.address() as net.AddressInfo).port)
+    )
+  );
+}
+
+function close(server: http.Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.closeAllConnections();
+    server.close(() => resolve());
+  });
+}
+
+/**
+ * A fake provider upstream that records the request body it received and
+ * answers with a configurable body and content type.
+ */
+async function fakeUpstream(
+  respondWith: { body: string; contentType: string }
+): Promise<{ server: http.Server; port: number; received: () => string }> {
+  let received = "";
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      received = Buffer.concat(chunks).toString("utf8");
+      res.writeHead(200, { "content-type": respondWith.contentType });
+      res.end(respondWith.body);
+    });
+  });
+  const port = await listen(server);
+  return { server, port, received: () => received };
+}
+
+/** A running proxy around an upstream, closed in afterEach. */
+const running: { close: () => Promise<void> }[] = [];
+
+async function proxyAround(
+  upstreamPort: number,
+  rules: ReplacementRule[]
+): Promise<string> {
+  const server = http.createServer((req, res) =>
+    handle(req, res, localTarget(upstreamPort), rules)
+  );
+  running.push({ close: () => close(server) });
+  const port = await listen(server);
+  return `http://127.0.0.1:${port}`;
+}
+
+afterEach(async () => {
+  while (running.length > 0) await running.pop()!.close();
+});
+
+describe("handle with match-and-replace rules", () => {
+  it("rewrites the request body going up and the response coming back", async () => {
+    const upstream = await fakeUpstream({
+      body: '{"text":"block it"}',
+      contentType: "application/json",
+    });
+    running.push({ close: () => close(upstream.server) });
+    const proxyUrl = await proxyAround(upstream.port, [
+      { match: "deny", replace: "allow" },
+      { match: "block", replace: "pass" },
+    ]);
+
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"prompt":"deny this"}',
+    });
+
+    expect(upstream.received()).toBe('{"prompt":"allow this"}');
+    expect(await response.text()).toBe('{"text":"pass it"}');
+    // The buffered rewrite recomputes content-length for the new body.
+    expect(response.headers.get("content-length")).toBe(
+      String(Buffer.byteLength('{"text":"pass it"}'))
+    );
+  });
+
+  it("passes both directions through byte-for-byte with no rules", async () => {
+    const upstream = await fakeUpstream({
+      body: '{"text":"deny block"}',
+      contentType: "application/json",
+    });
+    running.push({ close: () => close(upstream.server) });
+    const proxyUrl = await proxyAround(upstream.port, []);
+
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"prompt":"deny this"}',
+    });
+
+    expect(upstream.received()).toBe('{"prompt":"deny this"}');
+    expect(await response.text()).toBe('{"text":"deny block"}');
+  });
+
+  it("leaves the request alone when every rule is scoped to the response", async () => {
+    const upstream = await fakeUpstream({
+      body: "I deny that",
+      contentType: "text/plain",
+    });
+    running.push({ close: () => close(upstream.server) });
+    const proxyUrl = await proxyAround(upstream.port, [
+      { match: "deny", replace: "allow", scope: "response" },
+    ]);
+
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "deny deny",
+    });
+
+    expect(upstream.received()).toBe("deny deny");
+    expect(await response.text()).toBe("I allow that");
+  });
+
+  it("never touches a binary response, even with matching rules", async () => {
+    // The fake upstream answers text/plain-typed bytes that would match, but
+    // declares them image/png: the rule must not apply.
+    const upstream = await fakeUpstream({
+      body: "deny",
+      contentType: "image/png",
+    });
+    running.push({ close: () => close(upstream.server) });
+    const proxyUrl = await proxyAround(upstream.port, [
+      { match: "deny", replace: "allow" },
+    ]);
+
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"prompt":"deny"}',
+    });
+
+    expect(await response.text()).toBe("deny");
   });
 });

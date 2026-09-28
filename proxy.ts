@@ -32,6 +32,13 @@ import {
   type ResolvedTarget,
 } from "./agents";
 import { askChoice, clearChoice, loadChoice, saveChoice } from "./config";
+import {
+  contentTypeIsTextish,
+  loadReplacements,
+  rewriteBody,
+  rulesForScope,
+  type ReplacementRule,
+} from "./replacements";
 
 /**
  * A resolved target the proxy can actually route to and render: a catalogue
@@ -46,6 +53,15 @@ const PORT = Number(process.env.PORT ?? 8787);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = path.join(HERE, "logs");
 const STATE_FILE = path.join(HERE, ".agent-choice.json");
+// Match-and-replace rules, read from disk on every request so edits apply
+// without a restart. Missing or empty file = zero rules = byte-for-byte
+// pass-through, exactly as this tool behaved before the feature existed.
+const REPLACEMENTS_FILE = path.join(HERE, "replacements.json");
+
+/** A header value, when Node reports it as one value or many. */
+function header(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
 
 // ---------------------------------------------------------------------------
 // Proxying
@@ -132,10 +148,21 @@ function forwardHeaders(
   return out;
 }
 
-function handle(
+/**
+ * One request: buffer the agent's body, rewrite it if request rules apply,
+ * forward it upstream, then either stream the response straight back (no
+ * response rules — the agent is unaffected) or buffer and rewrite the
+ * response before returning it (response rules exist).
+ *
+ * The rules are read from disk on every call, so edits to replacements.json
+ * take effect on the next request without a restart. Tests pass rules
+ * directly instead.
+ */
+export function handle(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  target: ProxyTarget
+  target: ProxyTarget,
+  rules: ReplacementRule[] = loadReplacements(REPLACEMENTS_FILE)
 ): void {
   const reqPath = req.url ?? "/";
   // The path actually sent upstream: the agent's own request path, prefixed
@@ -151,19 +178,83 @@ function handle(
     const body = Buffer.concat(bodyChunks);
     const timestamp = new Date().toISOString();
     const base = baseName(target);
-    const encoding = req.headers["content-encoding"];
+    const requestEncoding = header(req.headers["content-encoding"]);
     const { hostname, port, useHttps } = upstreamConnection(target);
 
+    // Match-and-replace on the way out. The capture below logs the bytes
+    // that were actually forwarded, so the .md shows the model what it
+    // really received.
+    const requestRules = rulesForScope(rules, "request");
+    const responseRules = rulesForScope(rules, "response");
+    let forwardBody: Buffer = body;
+    let requestReplacements = 0;
+    if (
+      requestRules.length > 0 &&
+      contentTypeIsTextish(req.headers["content-type"])
+    ) {
+      const rewritten = rewriteBody(body, requestEncoding, requestRules);
+      forwardBody = rewritten.body;
+      requestReplacements = rewritten.count;
+    }
+
     const onUpstreamResponse = (upstreamRes: http.IncomingMessage) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+      const rewriteResponse =
+        responseRules.length > 0 &&
+        contentTypeIsTextish(upstreamRes.headers["content-type"]);
+
+      // No response rules, or a binary body: stream straight back to the
+      // agent, unbuffered, exactly as this tool behaved before
+      // match-and-replace existed.
+      if (!rewriteResponse) {
+        res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+        const responseChunks: Buffer[] = [];
+        upstreamRes.on("data", (chunk: Buffer) => {
+          responseChunks.push(chunk);
+          res.write(chunk); // stream straight back to the agent, unbuffered
+        });
+        upstreamRes.on("end", () => {
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: Buffer.concat(responseChunks).toString("utf8"),
+            requestReplacements,
+            responseReplacements: 0,
+          });
+        });
+        return;
+      }
+
+      // Rewriting a response means buffering it: a match can straddle
+      // chunks, so none of the body is safe to send until all of it is
+      // read. The agent's streaming is traded for a correct rewrite, and
+      // only while response rules exist. Content-length is recomputed for
+      // the rewritten body; the declared content-encoding stays true because
+      // rewriteBody re-compresses with the same algorithm.
       const responseChunks: Buffer[] = [];
-      upstreamRes.on("data", (chunk: Buffer) => {
-        responseChunks.push(chunk);
-        res.write(chunk); // stream straight back to the agent, unbuffered
-      });
+      upstreamRes.on("data", (chunk: Buffer) => responseChunks.push(chunk));
       upstreamRes.on("end", () => {
-        res.end();
-        const responseRaw = Buffer.concat(responseChunks).toString("utf8");
+        const raw = Buffer.concat(responseChunks);
+        const rewritten = rewriteBody(
+          raw,
+          header(upstreamRes.headers["content-encoding"]),
+          responseRules
+        );
+        const headers = { ...upstreamRes.headers };
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
+        if (rewritten.body.length > 0) {
+          headers["content-length"] = String(rewritten.body.length);
+        }
+        res.writeHead(upstreamRes.statusCode ?? 502, headers);
+        res.end(rewritten.body);
         writeCapture({
           base,
           target,
@@ -172,9 +263,11 @@ function handle(
           path: reqPath,
           statusCode: upstreamRes.statusCode ?? 0,
           headers: req.headers,
-          requestBody: body,
-          requestEncoding: Array.isArray(encoding) ? encoding[0] : encoding,
-          responseRaw,
+          requestBody: forwardBody,
+          requestEncoding,
+          responseRaw: rewritten.body.toString("utf8"),
+          requestReplacements,
+          responseReplacements: rewritten.count,
         });
       });
     };
@@ -185,7 +278,7 @@ function handle(
       path: upstreamPath,
       method: req.method,
       headers: {
-        ...forwardHeaders(req.headers, body),
+        ...forwardHeaders(req.headers, forwardBody),
         host: hostname,
       },
     };
@@ -203,7 +296,7 @@ function handle(
       );
     });
 
-    if (body.length > 0) upstreamReq.write(body);
+    if (forwardBody.length > 0) upstreamReq.write(forwardBody);
     upstreamReq.end();
   });
 }
@@ -244,6 +337,9 @@ interface Capture {
   requestBody: Buffer;
   requestEncoding?: string;
   responseRaw: string;
+  /** How many match-and-replace substitutions were applied each way. */
+  requestReplacements: number;
+  responseReplacements: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +482,13 @@ function writeCapture(c: Capture): void {
         `logs/${c.base}.md`
       )}`
     );
+    if (c.requestReplacements > 0 || c.responseReplacements > 0) {
+      console.log(
+        dim(
+          `           rewrote: request ${c.requestReplacements} match(es), response ${c.responseReplacements} match(es)`
+        )
+      );
+    }
   } catch (err) {
     console.error(
       `[request-logger] failed to write logs: ${(err as Error).message}`
@@ -405,7 +508,7 @@ function field(label: string, value: string): void {
   console.log(`  ${dim(label.padEnd(10))} ${value}`);
 }
 
-function printBanner(target: ProxyTarget): void {
+function printBanner(target: ProxyTarget, replacementRules: ReplacementRule[]): void {
   const rule = dim("-".repeat(72));
   const forwards =
     target.kind === "target" ? `https://${target.upstreamHost}` : target.upstreamBaseUrl;
@@ -415,6 +518,12 @@ function printBanner(target: ProxyTarget): void {
   field("Listening", `http://localhost:${PORT}`);
   field("Forwards", forwards);
   field("Logs", dim(LOG_DIR));
+  field(
+    "Rewrites",
+    replacementRules.length > 0
+      ? `${replacementRules.length} rule(s) from replacements.json`
+      : dim("off — replacements.json empty, traffic passes through")
+  );
   console.log(rule);
 
   for (const file of target.setup) {
@@ -543,10 +652,13 @@ async function main(): Promise<void> {
   }
 
   const target = resolution;
+  // Read once here only to describe the setup in the banner; handle() re-reads
+  // the file on every request so edits apply without a restart.
+  const replacementRules = loadReplacements(REPLACEMENTS_FILE);
   const server = http.createServer((req, res) => handle(req, res, target));
   server.on("upgrade", rejectUpgrade);
   server.listen(PORT, () => {
-    printBanner(target);
+    printBanner(target, replacementRules);
   });
 }
 
