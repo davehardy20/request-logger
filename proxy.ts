@@ -314,6 +314,15 @@ export function handle(
         const headers = { ...upstreamRes.headers };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
+        // Streaming mode rewrites bytes on the fly, so validators that
+        // describe the original body cannot be trusted even before a match
+        // is seen: drop them whenever response rules are active (the same
+        // reasoning as the buffered path's bytes-changed case).
+        if (responseRules.length > 0) {
+          delete headers.etag;
+          delete headers.digest;
+          delete headers["content-md5"];
+        }
         // An upstream that compresses despite the stripped accept-encoding
         // (rare, but it happens) must not feed the rewriter compressed
         // bytes: it would find no matches and pass the rules by silently.
@@ -690,7 +699,6 @@ function writeCapture(c: Capture): void {
     );
     return;
   }
-
 
   const burst = trackBurst(
     burstState,

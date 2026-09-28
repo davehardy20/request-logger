@@ -254,6 +254,10 @@ describe("contentTypeIsTextish", () => {
     expect(contentTypeIsTextish("application/xml")).toBe(true);
     expect(contentTypeIsTextish("application/atom+xml")).toBe(true);
     expect(contentTypeIsTextish("application/rss+xml; charset=utf-8")).toBe(true);
+    expect(contentTypeIsTextish("application/x-ndjson")).toBe(true);
+    expect(contentTypeIsTextish("application/ndjson; charset=utf-8")).toBe(true);
+    expect(contentTypeIsTextish("application/jsonl")).toBe(true);
+    expect(contentTypeIsTextish("application/vnd.api+ndjson")).toBe(true);
   });
 
   it("accepts a missing content type, so unstated does not mean untouched", () => {

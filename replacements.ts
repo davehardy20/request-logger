@@ -156,6 +156,14 @@ export function applyReplacements(
     if (rule.match === "") continue;
     const hits = out.split(rule.match).length - 1;
     if (hits === 0) continue;
+    // Estimate the single-rule output length before materializing it:
+    // replaceAll would otherwise allocate the oversized string first and
+    // only then trip the cap. Splits are non-overlapping, so the estimate
+    // is exact.
+    const estimate =
+      Buffer.byteLength(out, "utf8") +
+      hits * (Buffer.byteLength(rule.replace, "utf8") - Buffer.byteLength(rule.match, "utf8"));
+    if (estimate > limits.output) return { text, count: 0 };
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
     if (out.length > limits.output || Buffer.byteLength(out, "utf8") > limits.output) {
@@ -303,8 +311,12 @@ export function contentTypeIsTextish(contentType: string | string[] | undefined)
     type === "application/xml" ||
     type === "application/xhtml+xml" ||
     type === "application/x-www-form-urlencoded" ||
+    type === "application/x-ndjson" ||
+    type === "application/ndjson" ||
+    type === "application/jsonl" ||
     type.endsWith("+json") ||
-    type.endsWith("+xml")
+    type.endsWith("+xml") ||
+    type.endsWith("+ndjson")
   );
 }
 
