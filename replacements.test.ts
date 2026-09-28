@@ -284,6 +284,37 @@ describe("caps (RewriteLimits)", () => {
     expect(result.text).toBe("aaaaaaaaaaaaaaaa");
   });
 
+  it("does not skip a valid rewrite when surrogate pairs compose across rules", () => {
+    // \uD83D + \uDE00 encode as ONE 4-byte character (\u{1F600}), not two
+    // 3-byte ones; a byte estimate that cannot see the pairing would count
+    // 6 bytes and bail a rewrite whose true output is 4 bytes.
+    const caps = { decoded: 1024, input: 1024, output: 5, carry: 1024 };
+    const result = applyReplacements(
+      "XY",
+      [
+        { match: "X", replace: "\uD83D" },
+        { match: "Y", replace: "\uDE00" }
+      ],
+      caps
+    );
+    expect(result.count).toBe(2);
+    expect(result.text).toBe("\uD83D\uDE00");
+  });
+
+  it("still abandons the rewrite when the true surrogate output exceeds the cap", () => {
+    const caps = { decoded: 1024, input: 1024, output: 3, carry: 1024 };
+    const result = applyReplacements(
+      "XY",
+      [
+        { match: "X", replace: "\uD83D" },
+        { match: "Y", replace: "\uDE00" }
+      ],
+      caps
+    );
+    expect(result.count).toBe(0);
+    expect(result.text).toBe("XY");
+  });
+
   it("counts the output cap in encoded bytes, not string characters", () => {
     // 10 characters, 20 encoded UTF-8 bytes: a character-counted cap would
     // let it through; a byte-counted cap bails and returns the original.

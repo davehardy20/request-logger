@@ -145,6 +145,8 @@ export interface Replaced {
  * abandoned whole — the original text comes back with count 0, because
  * half-rewritten text would be worse than none.
  */
+const surrogatePattern = /[\uD800-\uDFFF]/;
+
 export function applyReplacements(
   text: string,
   rules: ReplacementRule[],
@@ -159,11 +161,22 @@ export function applyReplacements(
     // Estimate the single-rule output length before materializing it:
     // replaceAll would otherwise allocate the oversized string first and
     // only then trip the cap. Splits are non-overlapping, so the estimate
-    // is exact.
-    const estimate =
-      Buffer.byteLength(out, "utf8") +
-      hits * (Buffer.byteLength(rule.replace, "utf8") - Buffer.byteLength(rule.match, "utf8"));
-    if (estimate > limits.output) return { text, count: 0 };
+    // is exact — unless surrogate code units are in play: a high surrogate
+    // inserted here can pair with a low surrogate from a later rule and
+    // encode as one 4-byte character instead of two 3-byte ones, which
+    // would make the estimate overcount and skip a valid rewrite. When any
+    // surrogate is present, skip the pre-check; the post-check below
+    // remains the guard.
+    if (
+      !surrogatePattern.test(out) &&
+      !surrogatePattern.test(rule.match) &&
+      !surrogatePattern.test(rule.replace)
+    ) {
+      const estimate =
+        Buffer.byteLength(out, "utf8") +
+        hits * (Buffer.byteLength(rule.replace, "utf8") - Buffer.byteLength(rule.match, "utf8"));
+      if (estimate > limits.output) return { text, count: 0 };
+    }
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
     if (out.length > limits.output || Buffer.byteLength(out, "utf8") > limits.output) {
