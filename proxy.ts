@@ -37,6 +37,7 @@ import {
   contentTypeIsSse,
   contentTypeIsTextish,
   DEFAULT_LIMITS,
+  headWithinByteBudget,
   loadReplacements,
   makeStreamRewriter,
   type ReplacementRule,
@@ -252,7 +253,9 @@ export function handle(
         encKind !== "" &&
         encKind !== "identity" &&
         !streamingDecoder;
-      if (sseEncodingUnreadable) {
+      // Only worth warning when rules exist: with no response rules the
+      // stream is forwarded verbatim either way and the warning is noise.
+      if (sseEncodingUnreadable && responseRules.length > 0) {
         console.warn(
           `[request-logger] SSE response arrived ${encKind}-compressed; this tool has no streaming decoder for it, so the stream passes through untouched.`
         );
@@ -313,6 +316,13 @@ export function handle(
         const headers = { ...upstreamRes.headers };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
+        // Streaming mode rewrites bytes on the fly, so validators that
+        // describe the original body cannot be trusted even before a match
+        // is seen: drop them, the same reasoning as the buffered path's
+        // bytes-changed case. (Rules are known active here — canRewrite.)
+        delete headers.etag;
+        delete headers.digest;
+        delete headers["content-md5"];
         // An upstream that compresses despite the stripped accept-encoding
         // (rare, but it happens) must not feed the rewriter compressed
         // bytes: it would find no matches and pass the rules by silently.
@@ -328,6 +338,13 @@ export function handle(
           delete headers.etag;
           delete headers.digest;
           delete headers["content-md5"];
+          // pipe() does not forward upstream socket errors to the piped
+          // stream, so a dead socket mid-decompression must be caught here
+          // or the client would hang until its own timeout.
+          upstreamRes.on("error", (err: Error) => {
+            console.error(`[request-logger] SSE upstream error: ${err.message}`);
+            finish();
+          });
         }
         res.writeHead(statusCode, headers);
         // A stream can outlive any buffer: the capture keeps at most
@@ -349,7 +366,12 @@ export function handle(
             captureDropped = true;
           }
         };
+        let finished = false;
         const finish = (): void => {
+          // Guarded: an upstream socket error can arrive after the decoded
+          // stream already ended, and a second flush would double-write.
+          if (finished) return;
+          finished = true;
           const tail = rewriter.flush();
           if (tail.length > 0) push(tail);
           res.end();
@@ -425,7 +447,7 @@ export function handle(
             "[request-logger] response body passed the rewrite size cap; it is forwarded untouched instead of rewritten."
           );
           res.writeHead(statusCode, upstreamRes.headers);
-          for (const buffered of responseChunks) res.write(buffered);
+          for (const held of responseChunks) res.write(held);
           res.write(chunk);
           return;
         }
@@ -651,18 +673,19 @@ let burstState: BurstState | null = null;
  * promises.
  */
 function responseForCapture(c: Capture): Buffer {
-  const oversized = c.responseCaptureDropped === true || c.responseRaw.length > CAPTURE_LIMIT_BYTES;
-  const text = c.responseRaw.length > CAPTURE_LIMIT_BYTES
-    ? c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES)
-    : c.responseRaw;
-  if (oversized) {
-    console.log(
-      dim(
-        "[request-logger] response passed the capture size cap; the capture keeps the first part only."
-      )
-    );
-  }
-  return Buffer.from(text, "utf8");
+  // Count encoded bytes, not string characters: a multibyte-heavy response
+  // can be three bytes per character, and the budget is bytes. The cut
+  // itself lives in replacements.ts (headWithinByteBudget), tested there.
+  const oversized =
+    c.responseCaptureDropped === true ||
+    Buffer.byteLength(c.responseRaw, "utf8") > CAPTURE_LIMIT_BYTES;
+  if (!oversized) return Buffer.from(c.responseRaw, "utf8");
+  console.log(
+    dim(
+      "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+    )
+  );
+  return headWithinByteBudget(c.responseRaw, CAPTURE_LIMIT_BYTES);
 }
 
 function writeCapture(c: Capture): void {
@@ -676,7 +699,6 @@ function writeCapture(c: Capture): void {
     );
     return;
   }
-
 
   const burst = trackBurst(
     burstState,

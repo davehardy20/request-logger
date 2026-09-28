@@ -145,6 +145,45 @@ export interface Replaced {
  * abandoned whole — the original text comes back with count 0, because
  * half-rewritten text would be worse than none.
  */
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+/**
+ * Encoded UTF-8 byte length of `out` after replacing every occurrence of a
+ * rule's match with `replace`, counted from the split segments without
+ * materializing the result. A surrogate pair can form at an insertion
+ * boundary — the text's last char before the insertion being a high
+ * surrogate with the replacement's first a low one, or the replacement's
+ * last a high with the following text's first a low — and each such pair
+ * encodes 2 bytes fewer than the two characters would separately.
+ */
+function estimateRuleOutput(segs: string[], hits: number, replace: string): number {
+  const repFirstIsLow = isLowSurrogate(replace.charCodeAt(0));
+  const repLastIsHigh = isHighSurrogate(replace.charCodeAt(replace.length - 1));
+  let bytes = hits * Buffer.byteLength(replace, "utf8");
+  for (let i = 0; i < segs.length; i++) {
+    bytes += Buffer.byteLength(segs[i], "utf8");
+    if (i >= hits) continue;
+    if (repFirstIsLow && isHighSurrogate(segs[i].charCodeAt(segs[i].length - 1))) {
+      bytes -= 2;
+    }
+    if (repLastIsHigh && isLowSurrogate(segs[i + 1].charCodeAt(0))) {
+      bytes -= 2;
+    }
+    // An EMPTY replacement joins two segments directly: a high surrogate
+    // at the end of one and a low at the start of the next form a pair
+    // the replacement-boundary checks above cannot see.
+    if (
+      replace.length === 0 &&
+      isHighSurrogate(segs[i].charCodeAt(segs[i].length - 1)) &&
+      isLowSurrogate(segs[i + 1].charCodeAt(0))
+    ) {
+      bytes -= 2;
+    }
+  }
+  return bytes;
+}
+
 export function applyReplacements(
   text: string,
   rules: ReplacementRule[],
@@ -154,11 +193,26 @@ export function applyReplacements(
   let count = 0;
   for (const rule of rules) {
     if (rule.match === "") continue;
-    const hits = out.split(rule.match).length - 1;
+    const segs = out.split(rule.match);
+    const hits = segs.length - 1;
     if (hits === 0) continue;
+    // Exact pre-estimate of the single-rule output, so replaceAll never
+    // allocates an oversized string just to trip the post-check below.
+    // Splits are non-overlapping, and the only way the result can differ
+    // from segments-plus-replacements is a surrogate PAIR forming at an
+    // insertion boundary (a trailing high surrogate before an inserted
+    // low surrogate, or an inserted high before a following low): each
+    // pair encodes as one 4-byte character instead of two 3-byte ones,
+    // saving 2 bytes. Counting those keeps the estimate exact even for
+    // emoji-containing text, so nothing is skipped and nothing is
+    // over-bailed.
+    const estimate = estimateRuleOutput(segs, hits, rule.replace);
+    if (estimate > limits.output) return { text, count: 0 };
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
-    if (out.length > limits.output) return { text, count: 0 };
+    if (out.length > limits.output || Buffer.byteLength(out, "utf8") > limits.output) {
+      return { text, count: 0 };
+    }
   }
   return { text: out, count };
 }
@@ -301,7 +355,12 @@ export function contentTypeIsTextish(contentType: string | string[] | undefined)
     type === "application/xml" ||
     type === "application/xhtml+xml" ||
     type === "application/x-www-form-urlencoded" ||
-    type.endsWith("+json")
+    type === "application/x-ndjson" ||
+    type === "application/ndjson" ||
+    type === "application/jsonl" ||
+    type.endsWith("+json") ||
+    type.endsWith("+xml") ||
+    type.endsWith("+ndjson")
   );
 }
 
@@ -416,8 +475,11 @@ export function makeStreamRewriter(
           return Buffer.alloc(0);
         }
       }
-      // Never split a multi-byte UTF-8 character: step back over continuation bytes.
-      while (cut > 0 && (combined[cut] & 0xc0) === 0x80) cut--;
+      // Never split a multi-byte UTF-8 character, but never withhold more
+      // than the carry cap either: stepping back stops at the floor, and a
+      // mid-character boundary switches rewriteReady to verbatim below.
+      const min = Math.max(floor, 0);
+      while (cut > min && (combined[cut] & 0xc0) === 0x80) cut--;
       if (cut <= 0) {
         carry = combined;
         return Buffer.alloc(0);
@@ -438,4 +500,25 @@ export function makeStreamRewriter(
     },
     count: () => count
   };
+}
+
+/**
+ * Copies at most `budget` UTF-8 bytes of `text` without splitting a
+ * multi-byte character. A text longer than the budget never materializes
+ * whole: only its ≤ budget-character head is encoded (a transient of at
+ * most 3x the budget), then the cut is trimmed back to the byte budget.
+ * The budget is bytes, not characters — counting characters would let a
+ * multibyte-heavy text pass at up to 3x the limit.
+ */
+export function headWithinByteBudget(text: string, budget: number): Buffer {
+  if (text.length <= budget) {
+    const bytes = Buffer.from(text, "utf8");
+    let cut = Math.min(budget, bytes.length);
+    while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
+    return bytes.subarray(0, cut);
+  }
+  const head = Buffer.from(text.slice(0, budget), "utf8");
+  let cut = Math.min(budget, head.length);
+  while (cut > 0 && (head[cut] & 0xc0) === 0x80) cut--;
+  return head.subarray(0, cut);
 }
