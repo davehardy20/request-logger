@@ -77,14 +77,14 @@ export function resetLogDir(): void {
 const REPLACEMENTS_FILE = path.join(HERE, "replacements.json");
 
 /**
- * Size caps for response handling, shared by every path below: rewriting
- * stops past the decoded cap, and the capture never keeps more than that
- * same cap of a stream that may never end (a console note says so when it
- * happens). `decoded` comes from the replacements module so one body obeys
- * one budget everywhere.
+ * Size caps for response handling. Rewriting stops past the decoded cap.
+ * The capture keeps at most CAPTURE_LIMIT_BYTES per response — a per-stream
+ * memory budget, so several concurrent streams stay bounded (8 MiB each,
+ * not the full rewrite budget); a console note says when it truncates, and
+ * the agent still receives every byte.
  */
 const PROXY_LIMITS = { decoded: DEFAULT_LIMITS.decoded };
-const CAPTURE_LIMIT_BYTES = DEFAULT_LIMITS.decoded;
+const CAPTURE_LIMIT_BYTES = 8 * 1024 * 1024;
 
 /** A header value, when Node reports it as one value or many. */
 function header(value: string | string[] | undefined): string | undefined {

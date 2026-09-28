@@ -161,8 +161,9 @@ Things worth knowing:
   original text comes back; and the SSE rewriter never withholds more than
   1 MiB waiting for a match to complete, so a pathological stream keeps
   flowing even if a match spanning further than that goes unrewritten. The
-  on-disk capture keeps at most the first 64 MiB of a response (noted on the
-  console when it truncates); every byte still reaches the agent.
+  on-disk capture keeps at most the first 8 MiB of a response — a
+  per-stream budget, so several concurrent streams stay bounded — and says
+  so on the console when it truncates; every byte still reaches the agent.
   One pathological body cannot eat the process.
 - When a rewrite changes the bytes, headers that described the original bytes
   stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
