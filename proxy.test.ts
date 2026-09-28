@@ -505,3 +505,148 @@ describe("handle with match-and-replace rules", () => {
     expect(await response.text()).toBe("deny");
   });
 });
+
+describe("handle with Greptile review fixes", () => {
+  it("streams an SSE response through the rewriter instead of waiting for an end that never comes", async () => {
+    // The upstream writes one event, then sits open. If the proxy buffered
+    // the stream, the client would never see the event — that was the bug.
+    let releaseEnd: (() => void) | undefined;
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: de");
+      res.write("ny it\n\n");
+      void ended.then(() => res.end());
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    if (!response.body) throw new Error("expected a streamed response body");
+    const body = response.body;
+    const reader = body.getReader();
+
+    // The rewritten event must arrive while the upstream is still open.
+    let text = "";
+    const firstRead = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("no bytes arrived while upstream was open")), 2000)
+      )
+    ]);
+    if (firstRead.done || !firstRead.value) {
+      throw new Error("stream ended before the rewritten event arrived");
+    }
+    text += Buffer.from(firstRead.value).toString("utf8");
+    expect(text).toContain("allow");
+
+    releaseEnd?.();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += Buffer.from(value).toString("utf8");
+    }
+    expect(text).toBe("data: allow it\n\n");
+  });
+
+  it("rewrites a buffered SSE-like text body the same way when the stream does end", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end("data: block it\n\n");
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "block", replace: "pass" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    expect(await response.text()).toBe("data: pass it\n\n");
+  });
+
+  it("forwards a HEAD response's content-length untouched, even with response rules", async () => {
+    const server = http.createServer((req, res) => {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "content-type": "application/json", "content-length": "1234" });
+        res.end();
+      } else {
+        res.writeHead(405);
+        res.end();
+      }
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, { method: "HEAD" });
+    expect(response.headers.get("content-length")).toBe("1234");
+    expect(response.status).toBe(200);
+  });
+
+  it("drops ETag when a rewrite changed the bytes, and keeps it when nothing matched", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/json",
+        etag: '"original-bytes-v1"'
+      });
+      res.end('{"text":"deny"}');
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+
+    const rewrittenUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const untouchedUrl = await proxyAround(upstreamPort, [
+      { match: "nope", replace: "x" }
+    ]);
+
+    const rewritten = await fetch(
+      `${rewrittenUrl}/v1/chat/completions`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }
+    );
+    expect(await rewritten.text()).toBe('{"text":"allow"}');
+    expect(rewritten.headers.get("etag")).toBeNull();
+    expect(rewritten.headers.get("content-length")).toBe(
+      String(Buffer.byteLength('{"text":"allow"}'))
+    );
+
+    const untouched = await fetch(
+      `${untouchedUrl}/v1/chat/completions`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }
+    );
+    expect(await untouched.text()).toBe('{"text":"deny"}');
+    expect(untouched.headers.get("etag")).toBe('"original-bytes-v1"');
+  });
+
+  it("passes a binary body declared with a json-ish parameter through untouched", async () => {
+    // application/octet-stream; filename=config.json is binary despite the
+    // parameter — the media type is what counts.
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/octet-stream; filename=config.json" });
+      res.end("deny deny");
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    expect(await response.text()).toBe("deny deny");
+  });
+});

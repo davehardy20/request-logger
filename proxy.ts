@@ -33,8 +33,10 @@ import {
 import { askChoice, clearChoice, loadChoice, saveChoice } from "./config";
 import { renderMarkdown } from "./render";
 import {
+  contentTypeIsSse,
   contentTypeIsTextish,
   loadReplacements,
+  makeStreamRewriter,
   type ReplacementRule,
   rewriteBody,
   rulesForScope,
@@ -212,15 +214,21 @@ export function handle(
     }
 
     const onUpstreamResponse = (upstreamRes: http.IncomingMessage) => {
-      const rewriteResponse =
-        responseRules.length > 0 &&
-        contentTypeIsTextish(upstreamRes.headers["content-type"]);
+      const statusCode = upstreamRes.statusCode ?? 502;
+      const contentType = upstreamRes.headers["content-type"];
+      // A bodyless response (HEAD, 204, 304) carries nothing to rewrite, and
+      // its content-length describes a body that will never arrive — forward
+      // it verbatim rather than rewriting its headers around an empty body.
+      const bodyless =
+        req.method === "HEAD" || statusCode === 204 || statusCode === 304;
+      const canRewrite =
+        responseRules.length > 0 && !bodyless && contentTypeIsTextish(contentType);
 
-      // No response rules, or a binary body: stream straight back to the
-      // agent, unbuffered, exactly as this tool behaved before
-      // match-and-replace existed.
-      if (!rewriteResponse) {
-        res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+      // No response rules, a binary body, or nothing to rewrite: stream
+      // straight back to the agent, unbuffered, exactly as this tool behaved
+      // before match-and-replace existed.
+      if (!canRewrite) {
+        res.writeHead(statusCode, upstreamRes.headers);
         const responseChunks: Buffer[] = [];
         upstreamRes.on("data", (chunk: Buffer) => {
           responseChunks.push(chunk);
@@ -246,12 +254,60 @@ export function handle(
         return;
       }
 
-      // Rewriting a response means buffering it: a match can straddle
-      // chunks, so none of the body is safe to send until all of it is
-      // read. The agent's streaming is traded for a correct rewrite, and
-      // only while response rules exist. Content-length is recomputed for
-      // the rewritten body; the declared content-encoding stays true because
-      // rewriteBody re-compresses with the same algorithm.
+      // A Server-Sent Events stream may never end, so it can never be
+      // buffered whole: waiting for the end would hang the agent forever.
+      // Instead each chunk is rewritten as it arrives and sent on at once,
+      // with the last few bytes withheld until the next chunk shows what
+      // follows — see makeStreamRewriter.
+      if (contentTypeIsSse(contentType)) {
+        const rewriter = makeStreamRewriter(responseRules);
+        const headers = { ...upstreamRes.headers };
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
+        res.writeHead(statusCode, headers);
+        const written: Buffer[] = [];
+        upstreamRes.on("data", (chunk: Buffer) => {
+          const out = rewriter.push(chunk);
+          if (out.length > 0) {
+            written.push(out);
+            res.write(out);
+          }
+        });
+        upstreamRes.on("end", () => {
+          const tail = rewriter.flush();
+          if (tail.length > 0) {
+            written.push(tail);
+            res.write(tail);
+          }
+          res.end();
+          writeCapture({
+            base,
+            target,
+            timestamp,
+            method: req.method ?? "POST",
+            path: reqPath,
+            statusCode: upstreamRes.statusCode ?? 0,
+            headers: req.headers,
+            requestBody: forwardBody,
+            requestEncoding,
+            responseRaw: Buffer.concat(written).toString("utf8"),
+            requestReplacements,
+            responseReplacements: rewriter.count(),
+          });
+        });
+        return;
+      }
+
+      // Everything else is a whole body: buffer it, because a match can
+      // straddle chunks, so none of the body is safe to send until all of
+      // it is read. The agent's streaming is traded for a correct rewrite,
+      // and only while response rules exist. Nothing matched: the response
+      // is forwarded exactly as it arrived, headers and all. Something
+      // matched: lengths and digests that described the original bytes
+      // (content-length, ETag, Digest, Content-MD5) would misdescribe the
+      // rewritten ones, so length is recomputed and the digests dropped; the
+      // declared content-encoding stays true because rewriteBody
+      // re-compresses with the same algorithm.
       const responseChunks: Buffer[] = [];
       upstreamRes.on("data", (chunk: Buffer) => responseChunks.push(chunk));
       upstreamRes.on("end", () => {
@@ -261,14 +317,22 @@ export function handle(
           header(upstreamRes.headers["content-encoding"]),
           responseRules
         );
-        const headers = { ...upstreamRes.headers };
-        delete headers["content-length"];
-        delete headers["transfer-encoding"];
-        if (rewritten.body.length > 0) {
-          headers["content-length"] = String(rewritten.body.length);
+        if (rewritten.count === 0) {
+          res.writeHead(statusCode, upstreamRes.headers);
+          res.end(raw);
+        } else {
+          const headers = { ...upstreamRes.headers };
+          delete headers["content-length"];
+          delete headers["transfer-encoding"];
+          delete headers.etag;
+          delete headers.digest;
+          delete headers["content-md5"];
+          if (rewritten.body.length > 0) {
+            headers["content-length"] = String(rewritten.body.length);
+          }
+          res.writeHead(statusCode, headers);
+          res.end(rewritten.body);
         }
-        res.writeHead(upstreamRes.statusCode ?? 502, headers);
-        res.end(rewritten.body);
         writeCapture({
           base,
           target,
@@ -279,7 +343,7 @@ export function handle(
           headers: req.headers,
           requestBody: forwardBody,
           requestEncoding,
-          responseRaw: rewritten.body.toString("utf8"),
+          responseRaw: (rewritten.count === 0 ? raw : rewritten.body).toString("utf8"),
           requestReplacements,
           responseReplacements: rewritten.count,
         });

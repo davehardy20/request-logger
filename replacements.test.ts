@@ -5,8 +5,10 @@ import zlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyReplacements,
+  contentTypeIsSse,
   contentTypeIsTextish,
   loadReplacements,
+  makeStreamRewriter,
   type ReplacementRule,
   resetReplacementWarnings,
   rewriteBody,
@@ -259,5 +261,110 @@ describe("contentTypeIsTextish", () => {
     expect(contentTypeIsTextish("image/png")).toBe(false);
     expect(contentTypeIsTextish("audio/wav")).toBe(false);
     expect(contentTypeIsTextish("application/octet-stream")).toBe(false);
+  });
+});
+
+describe("caps (RewriteLimits)", () => {
+  it("abandons an expansionary rewrite whole when the output cap is exceeded", () => {
+    const tiny = { decoded: 1024, input: 1024, output: 32 };
+    const result = applyReplacements(
+      "aaaaaaaaaaaaaaaa",
+      [{ match: "a", replace: "aaaaaaaaaa" }],
+      tiny
+    );
+    expect(result.count).toBe(0);
+    expect(result.text).toBe("aaaaaaaaaaaaaaaa");
+  });
+
+  it("passes a body larger than the input cap through untouched", () => {
+    const tiny = { decoded: 1024, input: 8, output: 1024 };
+    const body = Buffer.from("deny deny deny deny");
+    const { body: out, count } = rewriteBody(
+      body,
+      undefined,
+      [{ match: "deny", replace: "allow" }],
+      tiny
+    );
+    expect(out).toBe(body);
+    expect(count).toBe(0);
+  });
+
+  it("passes a compressed body that would decompress past the cap through compressed, untouched", () => {
+    const tiny = { decoded: 256, input: 65536, output: 65536 };
+    // 4096 zero bytes gzip to a few dozen; the decoded size is what trips the cap.
+    const bomb = zlib.gzipSync(Buffer.alloc(4096));
+    const {
+      body: out,
+      encoding,
+      count
+    } = rewriteBody(bomb, "gzip", [{ match: "\0", replace: "x" }], tiny);
+    expect(out).toBe(bomb);
+    expect(encoding).toBe("gzip");
+    expect(count).toBe(0);
+  });
+});
+
+describe("contentType parsing", () => {
+  it("never lets a parameter turn a binary media type into text", () => {
+    expect(contentTypeIsTextish("application/octet-stream; filename=config.json")).toBe(false);
+    expect(contentTypeIsTextish("image/png; name=text.png")).toBe(false);
+  });
+
+  it("keeps accepting the textual media types, parameters included", () => {
+    expect(contentTypeIsTextish("application/json; charset=utf-8")).toBe(true);
+    expect(contentTypeIsTextish("Text/Plain; charset=latin-1")).toBe(true);
+    expect(contentTypeIsTextish("application/vnd.api+json")).toBe(true);
+  });
+
+  it("recognises SSE by media type only", () => {
+    expect(contentTypeIsSse("text/event-stream")).toBe(true);
+    expect(contentTypeIsSse("text/event-stream; charset=utf-8")).toBe(true);
+    expect(contentTypeIsSse("application/json")).toBe(false);
+    expect(contentTypeIsSse("text/event-streamx")).toBe(false);
+  });
+});
+
+describe("makeStreamRewriter", () => {
+  const rules: ReplacementRule[] = [{ match: "deny", replace: "allow" }];
+
+  it("rewrites a match that straddles a chunk boundary", () => {
+    const rewriter = makeStreamRewriter(rules);
+    const first = rewriter.push(Buffer.from("data: de"));
+    const second = rewriter.push(Buffer.from("ny it\n\n"));
+    const tail = rewriter.flush();
+    expect(Buffer.concat([first, second, tail]).toString("utf8")).toBe("data: allow it\n\n");
+    expect(rewriter.count()).toBe(1);
+  });
+
+  it("returns unmatched regions byte-identical", () => {
+    const rewriter = makeStreamRewriter(rules);
+    const chunk = Buffer.from("event: message\n\ndata: fine\n\n");
+    const out = rewriter.push(chunk);
+    const tail = rewriter.flush();
+    expect(Buffer.concat([out, tail]).equals(Buffer.concat([chunk, Buffer.alloc(0)]))).toBe(true);
+    expect(rewriter.count()).toBe(0);
+  });
+
+  it("keeps a multi-byte UTF-8 character split across chunks intact", () => {
+    const rewriter = makeStreamRewriter(rules);
+    // "dény" with the two-byte é split across the boundary. é is not e, so
+    // "deny" does not match — the test is that é survives the split intact.
+    const whole = Buffer.from("dény", "utf8");
+    const first = rewriter.push(whole.subarray(0, 2));
+    const second = rewriter.push(whole.subarray(2));
+    const tail = rewriter.flush();
+    expect(Buffer.concat([first, second, tail]).toString("utf8")).toBe("dény");
+    expect(rewriter.count()).toBe(0);
+  });
+
+  it("switches to verbatim pass-through when a chunk is not clean UTF-8", () => {
+    const rewriter = makeStreamRewriter(rules);
+    const bad = Buffer.from([0x64, 0x65, 0xe9]); // "de" + invalid latin-1 é
+    const out1 = rewriter.push(bad);
+    const good = rewriter.push(Buffer.from("deny after"));
+    const tail = rewriter.flush();
+    // The invalid chunk and everything after pass through untouched.
+    expect(Buffer.concat([out1, good, tail]).toString("latin1")).toBe("deédeny after");
+    expect(rewriter.count()).toBe(0);
   });
 });

@@ -139,8 +139,17 @@ export interface Replaced {
 /**
  * Apply the rules in order, feeding each rule the output of the last.
  * A rule with no hits costs nothing and leaves the text untouched.
+ *
+ * An expansionary rule set (longer replacements than matches) must not turn
+ * a modest body into an unbounded one: past the output cap the rewrite is
+ * abandoned whole — the original text comes back with count 0, because
+ * half-rewritten text would be worse than none.
  */
-export function applyReplacements(text: string, rules: ReplacementRule[]): Replaced {
+export function applyReplacements(
+  text: string,
+  rules: ReplacementRule[],
+  limits: RewriteLimits = DEFAULT_LIMITS
+): Replaced {
   let out = text;
   let count = 0;
   for (const rule of rules) {
@@ -149,23 +158,42 @@ export function applyReplacements(text: string, rules: ReplacementRule[]): Repla
     if (hits === 0) continue;
     out = out.replaceAll(rule.match, rule.replace);
     count += hits;
+    if (out.length > limits.output) return { text, count: 0 };
   }
   return { text: out, count };
 }
 
-/** Decompressors for the encodings this module can rewrite. */
-function decodeBody(body: Buffer, kind: string): Buffer | null {
+/** Size caps that keep one pathological body from eating the process. */
+export interface RewriteLimits {
+  /** A compressed body that would decode larger than this is passed through compressed, untouched. */
+  decoded: number;
+  /** A body larger than this (after decompression) is never rewritten. */
+  input: number;
+  /** A rewrite whose output would grow past this is abandoned; the original text comes back. */
+  output: number;
+}
+
+/** Caps sized for a single-user local proxy: generous, but never unbounded. */
+export const DEFAULT_LIMITS: RewriteLimits = {
+  decoded: 64 * 1024 * 1024,
+  input: 64 * 1024 * 1024,
+  output: 256 * 1024 * 1024
+};
+
+/** Decompressors for the encodings this module can rewrite, all bounded by the decoded cap. */
+function decodeBody(body: Buffer, kind: string, limits: RewriteLimits): Buffer | null {
+  const options = { maxOutputLength: limits.decoded };
   try {
-    if (kind === "gzip") return zlib.gunzipSync(body);
-    if (kind === "br") return zlib.brotliDecompressSync(body);
-    if (kind === "deflate") return zlib.inflateSync(body);
+    if (kind === "gzip") return zlib.gunzipSync(body, options);
+    if (kind === "br") return zlib.brotliDecompressSync(body, options);
+    if (kind === "deflate") return zlib.inflateSync(body, options);
     if (kind === "zstd" && typeof zlib.zstdDecompressSync === "function") {
-      return (zlib as unknown as { zstdDecompressSync: (b: Buffer) => Buffer }).zstdDecompressSync(
-        body
-      );
+      return (
+        zlib as unknown as { zstdDecompressSync: (b: Buffer, o: object) => Buffer }
+      ).zstdDecompressSync(body, options);
     }
   } catch {
-    return null; // claims that encoding but does not decode as it
+    return null; // claims that encoding but does not decode as it — or it would decode past the cap
   }
   return null;
 }
@@ -207,7 +235,8 @@ export interface RewrittenBody {
 export function rewriteBody(
   body: Buffer,
   encoding: string | undefined,
-  rules: ReplacementRule[]
+  rules: ReplacementRule[],
+  limits: RewriteLimits = DEFAULT_LIMITS
 ): RewrittenBody {
   const passthrough: RewrittenBody = {
     body,
@@ -221,10 +250,11 @@ export function rewriteBody(
   if (kind === "" || kind === "identity") {
     plain = body;
   } else {
-    const decoded = decodeBody(body, kind);
+    const decoded = decodeBody(body, kind, limits);
     if (decoded === null) return passthrough;
     plain = decoded;
   }
+  if (plain.length > limits.input) return passthrough; // too big to rewrite: forward as-is
 
   // A body that is not clean UTF-8 would be silently corrupted by a rewrite
   // it never asked for — toString swaps invalid bytes for U+FFFD. Only rewrite
@@ -233,7 +263,7 @@ export function rewriteBody(
   const text = plain.toString("utf8");
   if (!Buffer.from(text, "utf8").equals(plain)) return passthrough;
 
-  const { text: replaced, count } = applyReplacements(text, rules);
+  const { text: replaced, count } = applyReplacements(text, rules, limits);
   if (count === 0) return passthrough;
   const rewritten = Buffer.from(replaced, "utf8");
 
@@ -245,15 +275,107 @@ export function rewriteBody(
   return { body: encoded, encoding, count };
 }
 
-const TEXTUAL = /text|json|event-stream|javascript|xml|urlencoded/i;
+/** The media type of a content-type header, lowercased, without parameters. */
+function mediaType(contentType: string | string[] | undefined): string {
+  const value = Array.isArray(contentType) ? contentType[0] : contentType;
+  return (value ?? "").split(";")[0].trim().toLowerCase();
+}
 
 /**
- * Should a body of this content-type be considered rewritable text? A missing
- * content-type is treated as text: model APIs sometimes omit it, and a rule
- * that matches nothing costs nothing anyway.
+ * Should a body of this content-type be considered rewritable text? Only the
+ * media type decides — parameters never do, so
+ * `application/octet-stream; filename=config.json` is binary and stays
+ * untouched. A missing content-type is treated as text: model APIs
+ * sometimes omit it, and a rule that matches nothing costs nothing anyway.
  */
 export function contentTypeIsTextish(contentType: string | string[] | undefined): boolean {
-  const value = Array.isArray(contentType) ? contentType[0] : contentType;
-  if (!value) return true;
-  return TEXTUAL.test(value);
+  const type = mediaType(contentType);
+  if (type === "") return true;
+  return (
+    type.startsWith("text/") ||
+    type === "application/json" ||
+    type === "application/javascript" ||
+    type === "application/xml" ||
+    type === "application/xhtml+xml" ||
+    type === "application/x-www-form-urlencoded" ||
+    type.endsWith("+json")
+  );
+}
+
+/** Is this a Server-Sent Events stream, which must be rewritten while streaming? */
+export function contentTypeIsSse(contentType: string | string[] | undefined): boolean {
+  return mediaType(contentType) === "text/event-stream";
+}
+
+export interface StreamRewriter {
+  /** Rewrite one chunk as it arrives; returns the bytes safe to send now. */
+  push(chunk: Buffer): Buffer;
+  /** Rewrite the withheld tail. Call once, when the stream ends. */
+  flush(): Buffer;
+  /** Total matches replaced so far, the flush included. */
+  count(): number;
+}
+
+/**
+ * Rewrites a chunked text stream (SSE) without waiting for it to end.
+ *
+ * A never-ending stream can never be buffered whole, so each chunk is
+ * rewritten as it arrives and forwarded immediately. The last few bytes of
+ * every chunk are withheld — a match, or a multi-byte UTF-8 character, can
+ * straddle the boundary between two chunks — and carried into the next push.
+ * A chunk whose ready region is not clean UTF-8 switches the rewriter to
+ * verbatim pass-through for the rest of the stream: never corrupt beats
+ * always rewrite.
+ */
+export function makeStreamRewriter(
+  rules: ReplacementRule[],
+  limits: RewriteLimits = DEFAULT_LIMITS
+): StreamRewriter {
+  const maxMatch = rules.reduce((n, r) => Math.max(n, Buffer.byteLength(r.match)), 0);
+  // 4 bytes covers any UTF-8 character; maxMatch covers any literal match.
+  const tailLen = Math.max(4, maxMatch);
+  let carry = Buffer.alloc(0);
+  let count = 0;
+  let verbatim = false;
+
+  function rewriteReady(ready: Buffer): Buffer {
+    if (ready.length === 0) return Buffer.alloc(0);
+    const text = ready.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(ready)) {
+      verbatim = true;
+      return ready;
+    }
+    const { text: out, count: hits } = applyReplacements(text, rules, limits);
+    if (hits === 0) return ready; // nothing matched: the original bytes, unchanged
+    count += hits;
+    return Buffer.from(out, "utf8");
+  }
+
+  return {
+    push(chunk: Buffer): Buffer {
+      if (verbatim) return chunk;
+      const combined = Buffer.concat([carry, chunk]);
+      if (combined.length <= tailLen) {
+        carry = combined;
+        return Buffer.alloc(0);
+      }
+      let cut = combined.length - tailLen;
+      // Never split a multi-byte UTF-8 character: step back over continuation bytes.
+      while (cut > 0 && (combined[cut] & 0xc0) === 0x80) cut--;
+      const ready = combined.subarray(0, cut);
+      carry = combined.subarray(cut);
+      return rewriteReady(ready);
+    },
+    flush(): Buffer {
+      if (verbatim) {
+        const out = carry;
+        carry = Buffer.alloc(0);
+        return out;
+      }
+      const out = rewriteReady(carry);
+      carry = Buffer.alloc(0);
+      return out;
+    },
+    count: () => count
+  };
 }

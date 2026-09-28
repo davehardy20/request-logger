@@ -138,17 +138,31 @@ Things worth knowing:
 
 - The rules file is re-read on every request, so edits apply to the next
   request without restarting the tool.
-- Only textual bodies are rewritten (JSON, text, SSE, XML). Binary traffic —
-  images, audio — is never touched.
+- Only textual bodies are rewritten (JSON, text, XML, SSE). Binary traffic
+  is never touched — decided by the media type alone, so a parameter like
+  `application/octet-stream; filename=config.json` stays binary.
 - Compressed bodies (gzip, brotli, deflate, zstd) are decompressed, rewritten,
   and re-compressed with the same algorithm, so the declared encoding stays
   true. An encoding that cannot be decoded is passed through untouched rather
   than corrupted, and so is a textual body that is not valid UTF-8 (some other
   charset) — a rewrite must never corrupt bytes the rules never matched.
-- While response rules are in effect, responses are buffered instead of
-  streamed: a match can straddle chunk boundaries, so the whole body must be in
-  hand before any of it is safe to send. With no response rules, responses
-  stream back unbuffered as before.
+- Ordinary responses are buffered while response rules are in effect: a match
+  can straddle chunk boundaries, so the whole body must be in hand before any
+  of it is safe to send. Server-Sent Events streams are never buffered — a
+  stream that never ends can never be buffered whole — so each SSE chunk is
+  rewritten as it arrives and sent on immediately, with the last few bytes
+  held back until the next chunk shows what follows. With no response rules,
+  everything streams back unbuffered as before.
+- Rewriting is bounded. A compressed body that would decompress past 64 MiB is
+  passed through still compressed; a body larger than 64 MiB is never
+  rewritten; and a rule set whose combined output would grow past 256 MiB
+  (longer replacements than matches) is abandoned whole — the original text
+  comes back. One pathological body cannot eat the process.
+- When a rewrite changes the bytes, headers that described the original bytes
+  stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
+  `Content-MD5` are dropped. Nothing matched, and the response is forwarded
+  exactly as it arrived — headers and all. Bodyless responses (HEAD, 204,
+  304) are never touched, keeping their `Content-Length`.
 - A malformed rules file never takes traffic down: invalid JSON or invalid
   rules are reported once and skipped, and everything else passes through.
 - The log files show the traffic as rewritten — what actually went up and came
@@ -319,7 +333,8 @@ were sent, so you can still replay it.
 - Responses are **streamed straight back** as they arrive, so your agent
   behaves exactly as it would without the tool. The one exception is match
   and replace (see above): while response rules are in effect, responses are
-  buffered so the whole body can be rewritten before any of it is sent.
+  buffered so the whole body can be rewritten before any of it is sent —
+  except SSE streams, which keep streaming and are rewritten chunk by chunk.
 
 ### One message is not one request
 
