@@ -170,6 +170,16 @@ function estimateRuleOutput(segs: string[], hits: number, replace: string): numb
     if (repLastIsHigh && isLowSurrogate(segs[i + 1].charCodeAt(0))) {
       bytes -= 2;
     }
+    // An EMPTY replacement joins two segments directly: a high surrogate
+    // at the end of one and a low at the start of the next form a pair
+    // the replacement-boundary checks above cannot see.
+    if (
+      replace.length === 0 &&
+      isHighSurrogate(segs[i].charCodeAt(segs[i].length - 1)) &&
+      isLowSurrogate(segs[i + 1].charCodeAt(0))
+    ) {
+      bytes -= 2;
+    }
   }
   return bytes;
 }
