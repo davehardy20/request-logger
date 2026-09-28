@@ -161,10 +161,12 @@ Things worth knowing:
   original text comes back; and the SSE rewriter never withholds more than
   1 MiB waiting for a match to complete, so a pathological stream keeps
   flowing even if a match spanning further than that goes unrewritten. The
-  on-disk capture keeps at most the first 8 MiB of a response — a
+  on-disk capture of a response keeps at most the first 8 MiB — a
   per-stream budget, so several concurrent streams stay bounded — and says
   so on the console when it truncates; every byte still reaches the agent.
-  One pathological body cannot eat the process.
+  Request captures are never capped: the request is already in memory to be
+  forwarded, and a complete, replayable `.request.txt` is one of this tool's
+  promises. One pathological body cannot eat the process.
 - When a rewrite changes the bytes, headers that described the original bytes
   stop being true: `Content-Length` is recomputed, and `ETag`, `Digest`, and
   `Content-MD5` are dropped. The same validators are dropped when a

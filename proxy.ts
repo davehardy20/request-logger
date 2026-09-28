@@ -272,18 +272,13 @@ export function handle(
         // never end; the bytes themselves still all flow through.
         const responseChunks: Buffer[] = [];
         let captured = 0;
-        let truncationNoted = false;
+        let captureDropped = false;
         upstreamRes.on("data", (chunk: Buffer) => {
           if (captured < CAPTURE_LIMIT_BYTES) {
             responseChunks.push(chunk);
             captured += chunk.length;
-          } else if (!truncationNoted) {
-            truncationNoted = true;
-            console.log(
-              dim(
-                "[request-logger] response passed the capture size cap; the capture keeps the first part only."
-              )
-            );
+          } else {
+            captureDropped = true;
           }
           res.write(chunk); // stream straight back to the agent, unbuffered
         });
@@ -300,6 +295,7 @@ export function handle(
             requestBody: forwardBody,
             requestEncoding,
             responseRaw: Buffer.concat(responseChunks).toString("utf8"),
+            responseCaptureDropped: captureDropped,
             requestReplacements,
             responseReplacements: 0,
           });
@@ -341,6 +337,7 @@ export function handle(
         // stream that was never going to be reasonably rewritable anyway.
         const written: Buffer[] = [];
         let captured = 0;
+        let captureDropped = false;
         let fed = 0;
         let rewriteAbandoned = false;
         const push = (out: Buffer): void => {
@@ -348,6 +345,8 @@ export function handle(
           if (captured < CAPTURE_LIMIT_BYTES) {
             written.push(out);
             captured += out.length;
+          } else {
+            captureDropped = true;
           }
         };
         const finish = (): void => {
@@ -365,6 +364,7 @@ export function handle(
             requestBody: forwardBody,
             requestEncoding,
             responseRaw: Buffer.concat(written).toString("utf8"),
+            responseCaptureDropped: captureDropped,
             requestReplacements,
             responseReplacements: rewriter.count(),
           });
@@ -555,6 +555,8 @@ interface Capture {
   requestBody: Buffer;
   requestEncoding?: string;
   responseRaw: string;
+  /** True when a streaming path had to drop capture bytes (set by the path, so the boundary case notes too). */
+  responseCaptureDropped?: boolean;
   /** How many match-and-replace substitutions were applied each way. */
   requestReplacements: number;
   responseReplacements: number;
@@ -640,15 +642,27 @@ export function trackBurst(
 /** Module-level on purpose: one guard for the whole process, the same as LOG_DIR. */
 let burstState: BurstState | null = null;
 
-/** A capture on disk never exceeds the per-capture budget, whatever the wire did. */
-function cappedForCapture(bytes: Buffer, what: string): Buffer {
-  if (bytes.length <= CAPTURE_LIMIT_BYTES) return bytes;
-  console.log(
-    dim(
-      `[request-logger] ${what} passed the capture size cap; the capture keeps the first part only.`
-    )
-  );
-  return bytes.subarray(0, CAPTURE_LIMIT_BYTES);
+/**
+ * The response side of a capture never exceeds the per-capture budget on
+ * disk. The string is cut to length BEFORE the Buffer copy, so a huge
+ * buffered response is never duplicated in memory just to write a small
+ * capture. The request side is never capped: it is already in memory to be
+ * forwarded, and a complete, replayable .request.txt is one of this tool's
+ * promises.
+ */
+function responseForCapture(c: Capture): Buffer {
+  const oversized = c.responseCaptureDropped === true || c.responseRaw.length > CAPTURE_LIMIT_BYTES;
+  const text = c.responseRaw.length > CAPTURE_LIMIT_BYTES
+    ? c.responseRaw.slice(0, CAPTURE_LIMIT_BYTES)
+    : c.responseRaw;
+  if (oversized) {
+    console.log(
+      dim(
+        "[request-logger] response passed the capture size cap; the capture keeps the first part only."
+      )
+    );
+  }
+  return Buffer.from(text, "utf8");
 }
 
 function writeCapture(c: Capture): void {
@@ -709,9 +723,8 @@ function writeCapture(c: Capture): void {
     // must not write a capture several times larger than documented, and an
     // expansionary rule set cannot inflate the file past it either. The
     // .md renders from the same capped bytes.
-    const capturedRequest = cappedForCapture(c.requestBody, "request");
-    const capturedResponse = cappedForCapture(Buffer.from(c.responseRaw, "utf8"), "response");
-    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), capturedRequest);
+    const capturedResponse = responseForCapture(c);
+    fs.writeFileSync(path.join(LOG_DIR, `${c.base}.request.txt`), c.requestBody);
     fs.writeFileSync(path.join(LOG_DIR, `${c.base}.response.txt`), capturedResponse);
     fs.writeFileSync(
       path.join(LOG_DIR, `${c.base}.md`),
@@ -723,7 +736,7 @@ function writeCapture(c: Capture): void {
         path: c.path,
         statusCode: c.statusCode,
         headers: c.headers,
-        requestBody: capturedRequest,
+        requestBody: c.requestBody,
         requestEncoding: c.requestEncoding,
         responseRaw: capturedResponse.toString("utf8"),
       })
