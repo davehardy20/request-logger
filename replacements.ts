@@ -320,23 +320,41 @@ export interface StreamRewriter {
  * Rewrites a chunked text stream (SSE) without waiting for it to end.
  *
  * A never-ending stream can never be buffered whole, so each chunk is
- * rewritten as it arrives and forwarded immediately. The last few bytes of
- * every chunk are withheld — a match, or a multi-byte UTF-8 character, can
- * straddle the boundary between two chunks — and carried into the next push.
- * A chunk whose ready region is not clean UTF-8 switches the rewriter to
- * verbatim pass-through for the rest of the stream: never corrupt beats
- * always rewrite.
+ * rewritten as it arrives and forwarded immediately. The tail of every
+ * chunk is withheld until it is provably safe to emit: never in the middle
+ * of a multi-byte UTF-8 character, and never ending with the beginning of
+ * a match whose remainder has not arrived yet. A chunk whose ready region
+ * is not clean UTF-8 switches the rewriter to verbatim pass-through for
+ * the rest of the stream — never corrupt beats always rewrite.
  */
 export function makeStreamRewriter(
   rules: ReplacementRule[],
   limits: RewriteLimits = DEFAULT_LIMITS
 ): StreamRewriter {
-  const maxMatch = rules.reduce((n, r) => Math.max(n, Buffer.byteLength(r.match)), 0);
-  // 4 bytes covers any UTF-8 character; maxMatch covers any literal match.
-  const tailLen = Math.max(4, maxMatch);
+  const matchBuffers = rules.filter((r) => r.match !== "").map((r) => Buffer.from(r.match, "utf8"));
   let carry = Buffer.alloc(0);
   let count = 0;
   let verbatim = false;
+
+  /**
+   * The length of the longest suffix of `bytes` that is a proper prefix of
+   * some rule's match — i.e. how many trailing bytes could be the beginning
+   * of a match whose remainder has not arrived yet. Zero means the region
+   * ends cleanly and is safe to emit.
+   */
+  function partialMatchSuffix(bytes: Buffer): number {
+    let best = 0;
+    for (const match of matchBuffers) {
+      const take = Math.min(match.length - 1, bytes.length);
+      for (let n = take; n > best; n--) {
+        if (bytes.subarray(bytes.length - n).equals(match.subarray(0, n))) {
+          best = n;
+          break;
+        }
+      }
+    }
+    return best;
+  }
 
   function rewriteReady(ready: Buffer): Buffer {
     if (ready.length === 0) return Buffer.alloc(0);
@@ -353,15 +371,39 @@ export function makeStreamRewriter(
 
   return {
     push(chunk: Buffer): Buffer {
-      if (verbatim) return chunk;
+      if (verbatim) {
+        // Verbatim from here on, but the withheld tail still precedes this
+        // chunk in stream order — emit it first, or the client would see
+        // bytes arrive out of order.
+        const out = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+        carry = Buffer.alloc(0);
+        return out;
+      }
       const combined = Buffer.concat([carry, chunk]);
-      if (combined.length <= tailLen) {
+      if (combined.length <= 4) {
         carry = combined;
         return Buffer.alloc(0);
       }
-      let cut = combined.length - tailLen;
+      let cut = combined.length - 4;
+      // An emitted region must never END with the start of a match: a match
+      // straddling the emitted/withheld boundary would have its first half
+      // gone for good and could never be rewritten. Withhold byte by byte
+      // until the region's suffix is not a proper prefix of any match.
+      for (;;) {
+        const overlap = partialMatchSuffix(combined.subarray(0, cut));
+        if (overlap === 0) break;
+        cut -= overlap;
+        if (cut <= 0) {
+          carry = combined;
+          return Buffer.alloc(0);
+        }
+      }
       // Never split a multi-byte UTF-8 character: step back over continuation bytes.
       while (cut > 0 && (combined[cut] & 0xc0) === 0x80) cut--;
+      if (cut <= 0) {
+        carry = combined;
+        return Buffer.alloc(0);
+      }
       const ready = combined.subarray(0, cut);
       carry = combined.subarray(cut);
       return rewriteReady(ready);

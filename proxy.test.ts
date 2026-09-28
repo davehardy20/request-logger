@@ -6,6 +6,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type CustomTarget, resolveChoice } from "./agents";
 import {
@@ -648,5 +649,53 @@ describe("handle with Greptile review fixes", () => {
       body: "{}"
     });
     expect(await response.text()).toBe("deny deny");
+  });
+});
+
+describe("compressed SSE (Greptile round 2)", () => {
+  it("decodes a gzip SSE stream on the fly and rewrites it", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-encoding": "gzip"
+      });
+      res.write(zlib.gzipSync(Buffer.from("data: de")));
+      res.end(zlib.gzipSync(Buffer.from("ny it\n\n")));
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    // Sent on as identity: the content-encoding no longer applies.
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(await response.text()).toBe("data: allow it\n\n");
+  });
+
+  it("passes an SSE stream with an undecodable encoding through verbatim", async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-encoding": "custom"
+      });
+      res.end("data: deny it\n\n");
+    });
+    const upstreamPort = await listen(server);
+    running.push({ close: () => close(server) });
+    const proxyUrl = await proxyAround(upstreamPort, [
+      { match: "deny", replace: "allow" }
+    ]);
+    const response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    expect(response.headers.get("content-encoding")).toBe("custom");
+    expect(await response.text()).toBe("data: deny it\n\n");
   });
 });

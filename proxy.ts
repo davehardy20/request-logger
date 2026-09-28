@@ -23,6 +23,7 @@ import path from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { styleText } from "node:util";
+import zlib from "node:zlib";
 import {
   type AgentChoice,
   type CustomTarget,
@@ -221,8 +222,35 @@ export function handle(
       // it verbatim rather than rewriting its headers around an empty body.
       const bodyless =
         req.method === "HEAD" || statusCode === 204 || statusCode === 304;
+      // An SSE stream whose content-encoding has no streaming decoder here
+      // cannot be safely rewritten — treating compressed bytes as text is
+      // guessing. Stream it through verbatim with a warning instead.
+      const encKind = (header(upstreamRes.headers["content-encoding"]) ?? "")
+        .trim()
+        .toLowerCase();
+      const streamingDecoder: (() => zlib.Gunzip) | (() => zlib.Inflate) | (() => zlib.BrotliDecompress) | undefined =
+        encKind === "gzip"
+          ? zlib.createGunzip
+          : encKind === "deflate"
+            ? zlib.createInflate
+            : encKind === "br"
+              ? zlib.createBrotliDecompress
+              : undefined;
+      const sseEncodingUnreadable =
+        contentTypeIsSse(contentType) &&
+        encKind !== "" &&
+        encKind !== "identity" &&
+        !streamingDecoder;
+      if (sseEncodingUnreadable) {
+        console.warn(
+          `[request-logger] SSE response arrived ${encKind}-compressed; this tool has no streaming decoder for it, so the stream passes through untouched.`
+        );
+      }
       const canRewrite =
-        responseRules.length > 0 && !bodyless && contentTypeIsTextish(contentType);
+        responseRules.length > 0 &&
+        !bodyless &&
+        contentTypeIsTextish(contentType) &&
+        !sseEncodingUnreadable;
 
       // No response rules, a binary body, or nothing to rewrite: stream
       // straight back to the agent, unbuffered, exactly as this tool behaved
@@ -264,16 +292,30 @@ export function handle(
         const headers = { ...upstreamRes.headers };
         delete headers["content-length"];
         delete headers["transfer-encoding"];
+        // An upstream that compresses despite the stripped accept-encoding
+        // (rare, but it happens) must not feed the rewriter compressed
+        // bytes: it would find no matches and pass the rules by silently.
+        // Decode the stream on the way through and send it on as identity.
+        let source: NodeJS.ReadableStream = upstreamRes;
+        if (encKind !== "" && encKind !== "identity" && streamingDecoder) {
+          const decoder = streamingDecoder();
+          decoder.on("error", (err) => {
+            console.error(`[request-logger] SSE decode error: ${err.message}`);
+            res.end();
+          });
+          source = upstreamRes.pipe(decoder);
+          delete headers["content-encoding"];
+        }
         res.writeHead(statusCode, headers);
         const written: Buffer[] = [];
-        upstreamRes.on("data", (chunk: Buffer) => {
+        source.on("data", (chunk: Buffer) => {
           const out = rewriter.push(chunk);
           if (out.length > 0) {
             written.push(out);
             res.write(out);
           }
         });
-        upstreamRes.on("end", () => {
+        source.on("end", () => {
           const tail = rewriter.flush();
           if (tail.length > 0) {
             written.push(tail);

@@ -368,3 +368,45 @@ describe("makeStreamRewriter", () => {
     expect(rewriter.count()).toBe(0);
   });
 });
+
+describe("makeStreamRewriter boundary correctness (Greptile round 2)", () => {
+  it("rewrites a match that starts in an emitted region and completes in the next chunk", () => {
+    // abcSECRETxyz split as abcSEC | RETxyz: the match starts inside the
+    // region that would be emitted on the first push. It must not escape.
+    const rewriter = makeStreamRewriter([{ match: "SECRET", replace: "[redacted]" }]);
+    const out = [
+      rewriter.push(Buffer.from("abcSEC")),
+      rewriter.push(Buffer.from("RETxyz")),
+      rewriter.flush()
+    ];
+    expect(Buffer.concat(out).toString("utf8")).toBe("abc[redacted]xyz");
+    expect(rewriter.count()).toBe(1);
+  });
+
+  it("withholds an entire match that arrives one push at a time, rewriting at flush", () => {
+    const rewriter = makeStreamRewriter([{ match: "deny", replace: "allow" }]);
+    const out = [
+      rewriter.push(Buffer.from("x d")),
+      rewriter.push(Buffer.from("e")),
+      rewriter.push(Buffer.from("n")),
+      rewriter.push(Buffer.from("y x")),
+      rewriter.flush()
+    ];
+    expect(Buffer.concat(out).toString("utf8")).toBe("x allow x");
+    expect(rewriter.count()).toBe(1);
+  });
+
+  it("emits withheld bytes before later chunks when it switches to verbatim, preserving order", () => {
+    const rewriter = makeStreamRewriter([{ match: "deny", replace: "allow" }]);
+    // First chunk emits a rewritten region and withholds a tail.
+    const first = rewriter.push(Buffer.from("XXdeny YYYY"));
+    // Second chunk contains an invalid UTF-8 byte: the rewriter goes
+    // verbatim mid-stream, but the withheld tail must still come out first.
+    const second = rewriter.push(Buffer.concat([Buffer.from([0xe9]), Buffer.from("abc")]));
+    const third = rewriter.push(Buffer.from("def"));
+    const tail = rewriter.flush();
+    const joined = Buffer.concat([first, second, third, tail]);
+    expect(joined.toString("latin1")).toBe("XXallow YYYYéabcdef");
+    expect(joined.indexOf("YYYY")).toBeLessThan(joined.indexOf("abcdef"));
+  });
+});
