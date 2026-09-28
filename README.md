@@ -315,8 +315,10 @@ were sent, so you can still replay it.
   because several agents share the same URLs and guessing gets them wrong.
 - Your real auth header passes through untouched, so your requests authenticate
   normally. The tool only reads a copy on the way past.
-- Responses are **streamed straight back** as they arrive, so your agent behaves
-  exactly as it would without the tool.
+- Responses are **streamed straight back** as they arrive, so your agent
+  behaves exactly as it would without the tool. The one exception is match
+  and replace (see above): while response rules are in effect, responses are
+  buffered so the whole body can be rewritten before any of it is sent.
 
 ### One message is not one request
 
@@ -351,11 +353,12 @@ genuine POST the tool would otherwise write a full capture for. Left
 unchecked, that is thousands of near-identical files in a few seconds.
 
 Once the same method, path and status code repeats more than 20 times inside
-2 seconds, this tool stops writing a capture for every repeat. It still
-forwards every one of them untouched, so your agent is not affected; it just
-stops filling your disk and your terminal with duplicates. You get one loud
-warning naming the call and the likely causes, then a single summary line
-every 500 repeats for as long as the loop continues.
+2 seconds, this tool stops writing a capture for every repeat. Every repeat
+is still forwarded — and still rewritten, if match-and-replace rules are in
+effect — so your agent is not affected; the tool just stops filling your disk
+and your terminal with duplicates. You get one loud warning naming the call
+and the likely causes, then a single summary line every 500 repeats for as
+long as the loop continues.
 
 The fix is always upstream of this tool: stop the agent, fix the base URL,
 model ID or credentials, and start again. `omp` hitting `http://` instead of
