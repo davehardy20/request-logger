@@ -1,3 +1,6 @@
+// proxy.test.ts — unit tests for the proxy's pure pieces (target routing,
+// the burst guard, upgrade rejection) plus end-to-end handle() runs that
+// exercise match-and-replace through real sockets against a fake upstream.
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
